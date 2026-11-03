@@ -1,3 +1,26 @@
+## rclpy (jazzy) - 7.1.13-1
+
+The packages in the `rclpy` repository were released into the `jazzy` distro by running `/usr/bin/bloom-release --rosdistro jazzy --track jazzy rclpy` on `Tue, 03 Nov 2026 11:46:35 -0000`
+
+The `rclpy` package was released.
+
+Version of package(s) in repository `rclpy`:
+
+- upstream repository: https://github.com/ros2/rclpy.git
+- release repository: https://github.com/ros2-gbp/rclpy-release.git
+- rosdistro version: `7.1.12-1`
+- old version: `7.1.12-1`
+- new version: `7.1.13-1`
+
+Versions of tools used:
+
+- bloom version: `0.14.4`
+- catkin_pkg version: `1.1.1`
+- rosdep version: `0.27.0`
+- rosdistro version: `1.1.0`
+- vcstools version: `0.1.42`
+
+
 ## rclpy (kilted) - 9.1.8-1
 
 The packages in the `rclpy` repository were released into the `kilted` distro by running `/usr/bin/bloom-release --rosdistro kilted --track kilted rclpy` on `Tue, 03 Nov 2026 11:41:45 -0000`
