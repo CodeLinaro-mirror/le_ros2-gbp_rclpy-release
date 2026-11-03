@@ -832,7 +832,7 @@ void EventsExecutor::IterateTask(py::handle task)
         // can use the logger from that, otherwise we'll have to leave it undefined.
         py::object logger = py::none();
         if (nodes_.size() == 1) {
-          logger = py::list(nodes_)[0].attr("get_logger")();
+          logger = nodes_[0].attr("get_logger")();
         }
         HandleCallbackExceptionWithLogger(cpp_ex, logger, "task");
         throw;
@@ -877,7 +877,7 @@ void EventsExecutor::HandleCallbackExceptionWithLogger(
     R"(
 import traceback
 logger.fatal(f"Exception in '{node_entity_attr}' callback: {exc_value}")
-logger.warning("Error occurred at:\n" + "".join(traceback.format_tb(exc_trace)))
+logger.warn("Error occurred at:\n" + "".join(traceback.format_tb(exc_trace)))
 )",
     scope);
 }

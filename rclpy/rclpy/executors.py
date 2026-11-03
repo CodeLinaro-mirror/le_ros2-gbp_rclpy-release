@@ -13,20 +13,19 @@
 # limitations under the License.
 
 from collections import deque
-from collections.abc import Awaitable
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from contextlib import ExitStack
 from dataclasses import dataclass
 from functools import partial
 import inspect
 import os
-import threading
+from threading import Condition
+from threading import Lock
+from threading import RLock
 import time
 from types import TracebackType
 from typing import Any
 from typing import Callable
-from typing import cast
 from typing import ContextManager
 from typing import Coroutine
 from typing import Deque
@@ -40,7 +39,6 @@ from typing import Tuple
 from typing import Type
 from typing import TYPE_CHECKING
 from typing import TypeVar
-from typing import TypeVarTuple
 from typing import Union
 
 import warnings
@@ -58,29 +56,26 @@ from rclpy.subscription import MessageInfo
 from rclpy.subscription import Subscription
 from rclpy.task import Future
 from rclpy.task import Task
-from rclpy.timer import EmptyCallback
-from rclpy.timer import Timer
-from rclpy.timer import TimerCallbackUnion
-from rclpy.timer import TimerInfo
+from rclpy.timer import Timer, TimerInfo
 from rclpy.type_support import Msg
 from rclpy.utilities import get_default_context
 from rclpy.utilities import timeout_sec_to_nsec
 from rclpy.waitable import NumberOfEntities
 from rclpy.waitable import Waitable
 
-if TYPE_CHECKING:  # Avoid import cycle
-    from typing import TypeAlias
-
-    from rclpy.callback_groups import Entity
-    from rclpy.node import Node  # noqa: F401
-    EntityT = TypeVar('EntityT', bound=Entity)
-
-
 # For documentation purposes
 # TODO(jacobperron): Make all entities implement the 'Waitable' interface for better type checking
 
 T = TypeVar('T')
-Ts = TypeVarTuple('Ts')
+
+# Avoid import cycle
+if TYPE_CHECKING:
+    from typing import TypeAlias
+
+    from rclpy.node import Node  # noqa: F401
+    from .callback_groups import Entity
+    EntityT = TypeVar('EntityT', bound=Entity)
+
 
 YieldedCallback: 'TypeAlias' = Generator[Tuple[Task[None],
                                                'Optional[Entity]',
@@ -91,69 +86,25 @@ class _WorkTracker:
     """Track the amount of work that is in progress."""
 
     def __init__(self) -> None:
-        self._work_condition = threading.Condition()
-        # Per-thread reentrant counter of in-flight work. A thread has
-        # an entry iff it is currently inside __enter__/__exit__; the
-        # value is the reentrance depth. The set of keys is the
-        # set of threads currently running a callback.
-        self._executing_thread_counts: Dict[threading.Thread, int] = {}
-        # Threads whose in-flight callback (if any) is committed to
-        # finishing rather than making further progress -- i.e., the
-        # thread is parked in wait() or has already returned from
-        # wait() and is finishing the surrounding shutdown.  Their
-        # callback work should not block other waiters' drain checks;
-        # otherwise two callbacks on different worker threads both
-        # calling Executor.shutdown() would deadlock on each other.
-        # An entry is removed only when the owning callback ends
-        # (__exit__) or, for external callers with no in-flight
-        # callback, immediately when their wait() returns.
-        self._waiting_threads: Set[threading.Thread] = set()
+        # Number of tasks that are being executed
+        self._num_work_executing = 0
+        self._work_condition = Condition()
 
-    @contextmanager
-    def track_callback(self) -> Generator[None, None, None]:
-        """
-        Track an in-flight callback for the duration of the context.
-
-        The owning thread is captured at enter time and used to decrement
-        the per-thread count when the context exits -- even if the exit
-        runs on a different thread.  That happens when a coroutine using
-        this context manager is suspended at an inner ``await`` and then
-        closed via GC (e.g. during executor teardown): ``coro.close()``
-        raises ``GeneratorExit`` at the suspension point on whatever
-        thread the GC happened to run on, and the ``with`` block's
-        unwinding -- including this finally -- runs on that thread, not
-        the original worker thread.  Using ``threading.current_thread()``
-        in the finally would either lose the decrement (best case) or
-        ``KeyError`` (current case).
-        """
-        owner = threading.current_thread()
+    def __enter__(self) -> None:
+        """Increment the amount of executing work by 1."""
         with self._work_condition:
-            self._executing_thread_counts[owner] = (
-                self._executing_thread_counts.get(owner, 0) + 1)
-        try:
-            yield
-        finally:
-            with self._work_condition:
-                count = self._executing_thread_counts[owner] - 1
-                if count == 0:
-                    del self._executing_thread_counts[owner]
-                    # The thread's callback has ended, so it's no longer
-                    # "committed to finishing" -- drop its waiter
-                    # membership.
-                    self._waiting_threads.discard(owner)
-                else:
-                    self._executing_thread_counts[owner] = count
-                self._work_condition.notify_all()
+            self._num_work_executing += 1
+
+    def __exit__(self, exc_type: Optional[Type[BaseException]],
+                 exc_val: Optional[BaseException], exctb: Optional[TracebackType]) -> None:
+        """Decrement the amount of work executing by 1."""
+        with self._work_condition:
+            self._num_work_executing -= 1
+            self._work_condition.notify_all()
 
     def wait(self, timeout_sec: Optional[float] = None) -> bool:
         """
         Wait until all work completes.
-
-        Work being executed by the calling thread is excluded from the wait,
-        since that work is necessarily blocked on this call returning. Work
-        being executed by any other thread that has itself entered wait() is
-        also excluded, so concurrent shutdown() calls from inside callbacks
-        on different worker threads don't deadlock waiting for each other.
 
         :param timeout_sec: Seconds to wait. Block forever if None or negative. Don't wait if 0
         :type timeout_sec: float or None
@@ -161,52 +112,29 @@ class _WorkTracker:
         """
         if timeout_sec is not None and timeout_sec < 0.0:
             timeout_sec = None
-        current = threading.current_thread()
-
-        def other_work_drained() -> bool:
-            # True once every thread with in-flight work is itself in the
-            # waiting set, i.e., committed to finishing rather than making
-            # progress on its callback.
-            return self._executing_thread_counts.keys() <= self._waiting_threads
-
+        # Wait for all work to complete
         with self._work_condition:
-            added_self = current not in self._waiting_threads
-            if added_self:
-                self._waiting_threads.add(current)
-                # A new waiter may have just satisfied an existing
-                # waiter's condition (its in-flight work is now excluded).
-                self._work_condition.notify_all()
-            drained = False
-            try:
-                drained = self._work_condition.wait_for(other_work_drained, timeout_sec)
-                return drained
-            finally:
-                # Keep the waiter membership while a callback is still
-                # in flight on this thread -- removing it now would let
-                # other concurrent waiters' predicates flip back to
-                # False and re-block until our callback ends, even
-                # though our callback is committed to finishing (we are
-                # past wait() and the rest of shutdown is cleanup).
-                # __exit__ will drop the membership when the callback
-                # ends.  For external callers with no in-flight
-                # callback, no __exit__ will run, so discard here.
-                # However, if we timed out (not drained), we are NOT committed
-                # to finishing successfully, so we must discard the membership.
-                if added_self and (not drained or current not in self._executing_thread_counts):
-                    self._waiting_threads.discard(current)
-                    self._work_condition.notify_all()
+            if not self._work_condition.wait_for(
+                    lambda: self._num_work_executing == 0, timeout_sec):
+                return False
+        return True
 
 
-async def await_or_execute(callback: Callable[[*Ts], Awaitable[T] | T], *args: *Ts) -> T:
+@overload
+async def await_or_execute(callback: Callable[..., Coroutine[Any, Any, T]], *args: Any) -> T: ...
+
+
+@overload
+async def await_or_execute(callback: Callable[..., T], *args: Any) -> T: ...
+
+
+async def await_or_execute(callback: Callable[..., Any], *args: Any) -> Any:
     """Await a callback if it is a coroutine, else execute it."""
     if inspect.iscoroutinefunction(callback):
         # Await a coroutine
-        # See https://github.com/python/typeshed/issues/15529
-        callback = cast(Callable[[*Ts], Awaitable[T]], callback)
         return await callback(*args)
     else:
         # Call a normal function
-        callback = cast(Callable[[*Ts], T], callback)
         return callback(*args)
 
 
@@ -282,16 +210,13 @@ class Executor(ContextManager['Executor']):
     def __init__(self, *, context: Optional[Context] = None) -> None:
         super().__init__()
         self._context = get_default_context() if context is None else context
-        # A single stable wake-on-done callback, registered at most once per future (see
-        # _add_wake_on_done), so repeated spins on the same future never accumulate callbacks.
-        self._wake_on_done_cb: Callable[[Future[Any]], None] = lambda future: self.wake()
         self._nodes: Set[Node] = set()
-        self._nodes_lock = threading.RLock()
+        self._nodes_lock = RLock()
         # all tasks that are not complete or canceled
-        self._pending_tasks: Dict[Task[Any], TaskData] = {}
+        self._pending_tasks: Dict[Task, TaskData] = {}
         # tasks that are ready to execute
         self._ready_tasks: Deque[Task[Any]] = deque()
-        self._tasks_lock = threading.Lock()
+        self._tasks_lock = Lock()
         # This is triggered when wait_for_ready_callbacks should rebuild the wait list
         self._guard: Optional[GuardCondition] = GuardCondition(
             callback=None, callback_group=None, context=self._context)
@@ -299,7 +224,7 @@ class Executor(ContextManager['Executor']):
         self._is_shutdown = False
         self._work_tracker = _WorkTracker()
         # Protect against shutdown() being called in parallel in two threads
-        self._shutdown_lock = threading.Lock()
+        self._shutdown_lock = Lock()
         # State for wait_for_ready_callbacks to reuse generator
         self._cb_iter: Optional[YieldedCallback] = None
         self._last_args: Optional[tuple[object, ...]] = None
@@ -312,28 +237,24 @@ class Executor(ContextManager['Executor']):
         # True when the executor is spinning
         self._is_spinning = False
         # Protects access to _is_spinning
-        self._is_spinning_cond = threading.Condition()
-        self._spinning_thread: Optional[threading.Thread] = None
+        self._is_spinning_lock = Lock()
 
     def _enter_spin(self) -> None:
         """Mark the executor as spinning and prevent concurrent spins."""
-        with self._is_spinning_cond:
+        with self._is_spinning_lock:
             if self._is_spinning:
                 raise RuntimeError('Executor is already spinning')
             self._is_spinning = True
-            self._spinning_thread = threading.current_thread()
 
     def _exit_spin(self) -> None:
         """Clear the spinning flag."""
-        with self._is_spinning_cond:
+        with self._is_spinning_lock:
             self._is_spinning = False
-            self._spinning_thread = None
-            self._is_spinning_cond.notify_all()
 
     @property
     def is_spinning(self) -> bool:
         """Return whether the executor is currently spinning."""
-        with self._is_spinning_cond:
+        with self._is_spinning_lock:
             return self._is_spinning
 
     @property
@@ -362,13 +283,13 @@ class Executor(ContextManager['Executor']):
 
         :param callback: A callback to be run in the executor.
         """
-        task: Task[Any] = Task(callback, args, kwargs, executor=self)
+        task = Task(callback, args, kwargs, executor=self)
         with self._tasks_lock:
             self._pending_tasks[task] = TaskData()
         self._call_task_in_next_spin(task)
         return task
 
-    def _call_task_in_next_spin(self, task: Task[Any]) -> None:
+    def _call_task_in_next_spin(self, task: Task) -> None:
         """
         Add a task to the executor to be executed in the next spin.
 
@@ -379,7 +300,7 @@ class Executor(ContextManager['Executor']):
             if self._guard:
                 self._guard.trigger()
 
-    def create_future(self) -> Future[Any]:
+    def create_future(self) -> Future:
         """Create a Future object attached to the Executor."""
         return Future(executor=self)
 
@@ -393,54 +314,18 @@ class Executor(ContextManager['Executor']):
             timeout expires before all outstanding work is done.
         """
         with self._shutdown_lock:
-            initiated_shutdown = not self._is_shutdown
-            if initiated_shutdown:
+            if not self._is_shutdown:
                 self._is_shutdown = True
                 # Tell executor it's been shut down
                 if self._guard:
                     self._guard.trigger()
-        # The timeout applies to the whole shutdown operation — both the
-        # callback drain and the spinner exit — not to each wait
-        # individually. Convert it into a deadline once; each wait below
-        # gets only the time remaining against that deadline.
-        if timeout_sec is None or timeout_sec < 0:
-            deadline: Optional[float] = None  # block forever
-        else:
-            deadline = time.monotonic() + timeout_sec
-
-        def remaining_timeout() -> Optional[float]:
-            if deadline is None:
-                return None
-            return max(0.0, deadline - time.monotonic())
-
-        # Wait for any in-flight callbacks on OTHER threads to drain. Done
-        # unconditionally (not just for the initiating call) so that:
-        #   - concurrent shutdown() calls don't race past the wait and start
-        #     destroying state while callbacks are still running, and
-        #   - a caller who got False back from a timed-out shutdown() can
-        #     simply call shutdown() again (with a longer or no timeout) and
-        #     have the second call actually wait + finish cleanup.
-        # _work_tracker.wait excludes work being executed by the calling
-        # thread, so this is safe from inside a callback — it will not
-        # self-deadlock.
-        if not self._work_tracker.wait(remaining_timeout()):
-            return False
+        if not self._is_shutdown:
+            if not self._work_tracker.wait(timeout_sec):
+                return False
 
         # Clean up stuff that won't be used anymore
         with self._nodes_lock:
             self._nodes = set()
-
-        with self._is_spinning_cond:
-            if self._spinning_thread is not threading.current_thread():
-                # Wait for the spin thread to acknowledge shutdown and
-                # exit before we destroy the guards (which the spinner
-                # may still be holding in its wait_set). If the wait
-                # times out, return False per the contract — don't
-                # destroy resources that the spinner might still touch.
-                if not self._is_spinning_cond.wait_for(
-                        lambda: not self._is_spinning,
-                        timeout=remaining_timeout()):
-                    return False
 
         with self._shutdown_lock:
             if self._guard:
@@ -456,11 +341,7 @@ class Executor(ContextManager['Executor']):
 
     def __del__(self) -> None:
         if self._sigint_gc is not None:
-            try:
-                self._sigint_gc.destroy()
-            except InvalidHandle:
-                # already destroyed
-                pass
+            self._sigint_gc.destroy()
 
     def add_node(self, node: 'Node') -> bool:
         """
@@ -519,10 +400,6 @@ class Executor(ContextManager['Executor']):
         finally:
             self._exit_spin()
 
-    def _add_wake_on_done(self, future: Future[Any]) -> None:
-        """Register the wake-on-done callback at most once per future."""
-        future.add_done_callback(self._wake_on_done_cb, unique=True)
-
     def spin_until_future_complete(
         self,
         future: Future[Any],
@@ -532,7 +409,7 @@ class Executor(ContextManager['Executor']):
         # Mark executor as spinning to prevent concurrent spins
         self._enter_spin()
         # Make sure the future wakes this executor when it is done
-        self._add_wake_on_done(future)
+        future.add_done_callback(lambda x: self.wake())
         try:
             if timeout_sec is None or timeout_sec < 0:
                 while (
@@ -543,13 +420,7 @@ class Executor(ContextManager['Executor']):
                 ):
                     self._spin_once_until_future_complete(future, timeout_sec)
             else:
-                # Use perf_counter() rather than monotonic(): on Windows with
-                # CPython < 3.13, monotonic() is based on GetTickCount64() with
-                # ~15.6ms resolution, which can quantize the start time such
-                # that this loop exits up to one tick earlier than timeout_sec
-                # in real time. perf_counter() is monotonic on all supported
-                # platforms and has sub-microsecond resolution.
-                start = time.perf_counter()
+                start = time.monotonic()
                 end = start + timeout_sec
                 timeout_left = TimeoutObject(timeout_sec)
 
@@ -560,26 +431,15 @@ class Executor(ContextManager['Executor']):
                     and not self._is_shutdown
                 ):
                     self._spin_once_until_future_complete(future, timeout_left)
-                    now = time.perf_counter()
+                    now = time.monotonic()
 
                     if now >= end:
-                        break
+                        self._exit_spin()
+                        return
 
                     timeout_left.timeout = end - now
         finally:
             self._exit_spin()
-
-        # If the future completed with an exception, re-raise it. The
-        # SingleThreadedExecutor re-raises synchronously inside _spin_once_impl
-        # so we never reach this code in that case. The MultiThreadedExecutor
-        # runs handlers on worker threads; the outer loop above can observe
-        # future.done() == True and exit before the next _spin_once_impl
-        # iteration would have called future.result(). Surfacing the
-        # exception here keeps the contract uniform across executor types.
-        if future.done():
-            exc = future.exception()
-            if exc is not None:
-                raise exc
 
     def spin_once(self, timeout_sec: Optional[float] = None) -> None:
         """
@@ -634,7 +494,8 @@ class Executor(ContextManager['Executor']):
                     actual_call_time=info['actual_call_time'],
                     clock_type=tmr.clock.clock_type)
 
-                def check_argument_type(callback_func: TimerCallbackUnion,
+                def check_argument_type(callback_func: Union[Callable[[], None],
+                                                             Callable[[TimerInfo], None]],
                                         target_type: Type[TimerInfo]) -> Optional[str]:
                     sig = inspect.signature(callback_func)
                     for param in sig.parameters.values():
@@ -658,7 +519,7 @@ class Executor(ContextManager['Executor']):
                 else:
                     async def _execute() -> None:
                         if tmr.callback:
-                            await await_or_execute(cast(EmptyCallback, tmr.callback))
+                            await await_or_execute(tmr.callback)
                     return _execute
         except InvalidHandle:
             # Timer is a Destroyable, which means that on __enter__ it can throw an
@@ -681,13 +542,12 @@ class Executor(ContextManager['Executor']):
                     return None
 
                 if sub._callback_type is Subscription.CallbackType.MessageOnly:
-                    msg_tuple: Union[tuple[Msg | bytes],
-                                     tuple[Msg | bytes, MessageInfo]] = (msg_info[0], )
+                    msg_tuple: Union[Tuple[Msg], Tuple[Msg, MessageInfo]] = (msg_info[0], )
                 else:
                     msg_tuple = msg_info
 
                 async def _execute() -> None:
-                    await await_or_execute(sub.callback, *msg_tuple)  # type: ignore [arg-type]
+                    await await_or_execute(sub.callback, *msg_tuple)
 
                 return _execute
         except InvalidHandle:
@@ -795,7 +655,7 @@ class Executor(ContextManager['Executor']):
                 entity._executor_event = False
                 gc.trigger()
                 return
-            with work_tracker.track_callback():
+            with work_tracker:
                 # The take_from_wait_list method here is expected to return either an async def
                 # method or None if there is no work to do.
                 call_coroutine = take_from_wait_list(entity)
@@ -861,9 +721,7 @@ class Executor(ContextManager['Executor']):
         timeout_nsec = timeout_sec_to_nsec(
             timeout_sec.timeout if isinstance(timeout_sec, TimeoutObject) else timeout_sec)
         if timeout_nsec > 0:
-            timeout_timer = Timer(
-                None, timeout_nsec, self._clock, context=self._context
-            )
+            timeout_timer = Timer(None, None, timeout_nsec, self._clock, context=self._context)
 
         yielded_work = False
         while not yielded_work and not self._is_shutdown and not condition():
@@ -1174,7 +1032,7 @@ class SingleThreadedExecutor(Executor):
     ) -> None:
         # Mark executor as spinning to prevent concurrent spins
         self._enter_spin()
-        self._add_wake_on_done(future)
+        future.add_done_callback(lambda x: self.wake())
         try:
             self._spin_once_until_future_complete(future, timeout_sec)
         finally:
@@ -1214,7 +1072,6 @@ class MultiThreadedExecutor(Executor):
                 'Use the SingleThreadedExecutor instead.')
         self._futures: List[Future[Any]] = []
         self._executor = ThreadPoolExecutor(num_threads)
-        self._futures_lock = threading.Lock()
 
     def _spin_once_impl(
         self,
@@ -1235,9 +1092,10 @@ class MultiThreadedExecutor(Executor):
         else:
             self._executor.submit(handler)
             self._futures.append(handler)
-            with self._futures_lock:
-                done_futures = [f for f in self._futures if f.done() or f.cancelled()]
-                for future in done_futures:
+            # make a copy of the list that we iterate over while modifying it
+            # (https://stackoverflow.com/q/1207406/3753684)
+            for future in self._futures[:]:
+                if future.done():
                     self._futures.remove(future)
                     future.result()  # raise any exceptions
 
@@ -1266,7 +1124,7 @@ class MultiThreadedExecutor(Executor):
     ) -> None:
         # Mark executor as spinning to prevent concurrent spins
         self._enter_spin()
-        self._add_wake_on_done(future)
+        future.add_done_callback(lambda x: self.wake())
         try:
             self._spin_once_until_future_complete(future, timeout_sec)
         finally:
@@ -1284,27 +1142,10 @@ class MultiThreadedExecutor(Executor):
         :param timeout_sec: Seconds to wait. Block forever if ``None`` or negative.
             Don't wait if 0.
         :param wait_for_threads: If true, this function will block until all executor threads
-            have joined. When shutdown() is called from inside a callback running on one of
-            this executor's worker threads, the *current* thread is necessarily excluded from
-            that join (Python cannot join a thread with itself) -- the rest of the callback
-            will finish after this returns and the worker will exit naturally.
+            have joined.
         :return: ``True`` if all outstanding callbacks finished executing, or ``False`` if the
             timeout expires before all outstanding work is done.
         """
         success: bool = super().shutdown(timeout_sec)
-        if not success:
-            return False
-        # Always tell the pool to shut down without waiting: if shutdown()
-        # was called from inside a callback running on one of these
-        # workers, letting ThreadPoolExecutor.shutdown(wait=True) join the
-        # current thread would raise RuntimeError. We do the joins below
-        # ourselves so we can skip the current thread.
-        self._executor.shutdown(wait=False)
-        if wait_for_threads:
-            current = threading.current_thread()
-            # Snapshot before iterating; _threads is stable post-shutdown
-            # (no new workers are spawned) but we copy defensively.
-            for t in list(self._executor._threads):
-                if t is not current:
-                    t.join()
+        self._executor.shutdown(wait=wait_for_threads)
         return success

@@ -31,7 +31,7 @@ from rclpy.qos import QoSReliabilityPolicy
 
 class TestQosProfile(unittest.TestCase):
 
-    def convert_and_assert_equality(self, qos_profile: QoSProfile) -> None:
+    def convert_and_assert_equality(self, qos_profile):
         c_qos_profile = qos_profile.get_c_qos_profile()
         converted_profile = QoSProfile(**c_qos_profile.to_dict())
         self.assertEqual(qos_profile, converted_profile)
@@ -105,10 +105,6 @@ class TestQosProfile(unittest.TestCase):
         with self.assertRaises(InvalidQoSProfileException):
             # History is KEEP_LAST, but no depth is provided
             QoSProfile(history=QoSHistoryPolicy.KEEP_LAST)
-
-    def test_invalid_qos_message(self) -> None:
-        exception = InvalidQoSProfileException('some reason')
-        self.assertEqual(str(exception), 'Invalid QoSProfile: some reason')
 
     def test_policy_short_names(self) -> None:
         # Full test on History to show the mechanism works

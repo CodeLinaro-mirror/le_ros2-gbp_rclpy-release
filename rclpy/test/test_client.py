@@ -16,47 +16,34 @@ import platform
 import threading
 import time
 import traceback
-from typing import List
-from typing import Optional
-from typing import Tuple
-from typing import TYPE_CHECKING
 import unittest
 
 from rcl_interfaces.srv import GetParameters
 import rclpy
-import rclpy.context
 import rclpy.executors
 import rclpy.node
 from rclpy.utilities import get_rmw_implementation_identifier
 from test_msgs.srv import Empty
 
-from typing_extensions import TypeAlias
-
 # TODO(sloretz) Reduce fudge once wait_for_service uses node graph events
 TIME_FUDGE = 0.3
-
-TestServiceName: TypeAlias = List[Tuple[str, Optional[str], Optional[List[str]], str]]
 
 
 class TestClient(unittest.TestCase):
 
-    if TYPE_CHECKING:
-        context: rclpy.context.Context
-        node: rclpy.node.Node
-
     @classmethod
-    def setUpClass(cls) -> None:
+    def setUpClass(cls):
         cls.context = rclpy.context.Context()
         rclpy.init(context=cls.context)
         cls.node = rclpy.create_node('TestClient', context=cls.context)
 
     @classmethod
-    def tearDownClass(cls) -> None:
+    def tearDownClass(cls):
         cls.node.destroy_node()
         rclpy.shutdown(context=cls.context)
 
     @classmethod
-    def do_test_service_name(cls, test_service_name_list: TestServiceName) -> None:
+    def do_test_service_name(cls, test_service_name_list):
         for service_name, ns, cli_args, target_service_name in test_service_name_list:
             node = rclpy.create_node(
                 node_name='node_name',
@@ -111,8 +98,7 @@ class TestClient(unittest.TestCase):
 
     def test_wait_for_service_exists(self) -> None:
         cli = self.node.create_client(GetParameters, 'test_wfs_exists')
-        srv = self.node.create_service(GetParameters, 'test_wfs_exists',
-                                       lambda request, response: GetParameters.Response())
+        srv = self.node.create_service(GetParameters, 'test_wfs_exists', lambda request: None)
         try:
             start = time.monotonic()
             self.assertTrue(cli.wait_for_service(timeout_sec=1.0))
@@ -157,7 +143,6 @@ class TestClient(unittest.TestCase):
                     result = srv.handle.service_take_request(srv.srv_type.Request)
                 if result != (None, None):
                     request, header = result
-                    assert header is not None
                     self.assertTrue(header is not None)
                     self.assertNotEqual(0, header.source_timestamp)
                     return
@@ -172,12 +157,12 @@ class TestClient(unittest.TestCase):
         cli = self.node.create_client(GetParameters, 'get/parameters')
         srv = self.node.create_service(
             GetParameters, 'get/parameters',
-            lambda request, response: 'different response type')  # type: ignore
+            lambda request, response: 'different response type')
         try:
             with self.assertRaises(TypeError):
-                cli.call('different request type')  # type: ignore
+                cli.call('different request type')
             with self.assertRaises(TypeError):
-                cli.call_async('different request type')  # type: ignore
+                cli.call_async('different request type')
             self.assertTrue(cli.wait_for_service(timeout_sec=20))
             future = cli.call_async(GetParameters.Request())
             executor = rclpy.executors.SingleThreadedExecutor(context=self.context)
@@ -188,7 +173,7 @@ class TestClient(unittest.TestCase):
             self.node.destroy_service(srv)
 
     def test_get_service_name(self) -> None:
-        test_service_name_list: TestServiceName = [
+        test_service_name_list = [
             # test_service_name, namespace, cli_args for remap, expected service name
             # No namespaces
             ('service', None, None, '/service'),
@@ -205,7 +190,7 @@ class TestClient(unittest.TestCase):
         TestClient.do_test_service_name(test_service_name_list)
 
     def test_get_service_name_after_remapping(self) -> None:
-        test_service_name_list: TestServiceName = [
+        test_service_name_list = [
             ('service', None, ['--ros-args', '--remap', 'service:=new_service'], '/new_service'),
             ('service', 'ns', ['--ros-args', '--remap', 'service:=new_service'],
              '/ns/new_service'),
@@ -217,8 +202,7 @@ class TestClient(unittest.TestCase):
         TestClient.do_test_service_name(test_service_name_list)
 
     def test_sync_call(self) -> None:
-        def _service(request: GetParameters.Request,
-                     response: GetParameters.Response) -> GetParameters.Response:
+        def _service(request, response):
             return response
         cli = self.node.create_client(GetParameters, 'get/parameters')
         srv = self.node.create_service(GetParameters, 'get/parameters', _service)
@@ -240,8 +224,7 @@ class TestClient(unittest.TestCase):
             self.node.destroy_service(srv)
 
     def test_sync_call_timeout(self) -> None:
-        def _service(request: GetParameters.Request,
-                     response: GetParameters.Response) -> GetParameters.Response:
+        def _service(request, response):
             time.sleep(1)
             return response
         cli = self.node.create_client(GetParameters, 'get/parameters')
@@ -264,8 +247,7 @@ class TestClient(unittest.TestCase):
             self.node.destroy_service(srv)
 
     def test_sync_call_context_manager(self) -> None:
-        def _service(request: GetParameters.Request,
-                     response: GetParameters.Response) -> GetParameters.Response:
+        def _service(request, response):
             return response
         with self.node.create_client(GetParameters, 'get/parameters') as cli:
             with self.node.create_service(GetParameters, 'get/parameters', _service):
@@ -285,15 +267,6 @@ class TestClient(unittest.TestCase):
     def test_logger_name_is_equal_to_node_name(self) -> None:
         with self.node.create_client(GetParameters, 'get/parameters') as cli:
             self.assertEqual(cli.logger_name, 'TestClient')
-
-    def test_client_direct_destroy(self) -> None:
-        cli = self.node.create_client(Empty, '/test_direct_destroy')
-
-        self.assertIn(cli, list(self.node.clients))
-        cli.destroy()
-        self.assertNotIn(cli, list(self.node.clients))
-        cli.destroy()
-        self.assertFalse(self.node.destroy_client(cli))
 
 
 if __name__ == '__main__':

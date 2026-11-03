@@ -66,7 +66,6 @@ private:
   {
     std::unique_ptr<std::function<void(size_t)>> cb;
     std::shared_ptr<ScopedWith> with;
-    std::function<void(size_t)> callback;
   };
 
   EventsQueue * const events_queue_;

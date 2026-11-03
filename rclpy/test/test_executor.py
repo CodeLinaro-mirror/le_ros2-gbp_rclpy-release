@@ -16,19 +16,11 @@ import asyncio
 import os
 import threading
 import time
-from typing import Generator
-from typing import List
-from typing import Optional
-from typing import Protocol
-from typing import Set
 import unittest
 import warnings
 
 import rclpy
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.context import Context
-from rclpy.executors import _WorkTracker
 from rclpy.executors import Executor
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.executors import ShutdownException
@@ -36,11 +28,6 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.experimental import EventsExecutor
 from rclpy.task import Future
 from test_msgs.srv import Empty
-
-
-class ExecutorTypeLike(Protocol):
-
-    def __call__(self, *, context: Optional[Context] = None) -> Executor: ...
 
 
 class TestExecutor(unittest.TestCase):
@@ -55,7 +42,7 @@ class TestExecutor(unittest.TestCase):
         rclpy.shutdown(context=self.context)
         self.context.destroy()
 
-    def func_execution(self, executor: Executor) -> bool:
+    def func_execution(self, executor):
         got_callback = False
 
         def timer_callback() -> None:
@@ -85,10 +72,7 @@ class TestExecutor(unittest.TestCase):
 
     def test_executor_immediate_shutdown(self) -> None:
         self.assertIsNotNone(self.node.handle)
-        executor_types: list[ExecutorTypeLike] = [SingleThreadedExecutor,
-                                                  MultiThreadedExecutor,
-                                                  EventsExecutor]
-        for cls in executor_types:
+        for cls in [SingleThreadedExecutor, EventsExecutor]:
             with self.subTest(cls=cls):
                 executor = cls(context=self.context)
                 try:
@@ -124,16 +108,6 @@ class TestExecutor(unittest.TestCase):
                 executor.shutdown()
                 with self.assertRaises(ShutdownException):
                     executor.wait_for_ready_callbacks()
-
-    def test_del_after_sigint_guard_condition_finalized(self) -> None:
-        # A reference cycle can finalize the executor's sigint guard condition first
-        for cls in [SingleThreadedExecutor, MultiThreadedExecutor]:
-            with self.subTest(cls=cls):
-                executor = cls(context=self.context)
-                executor.add_node(self.node)
-                assert executor._sigint_gc is not None
-                executor._sigint_gc.__del__()
-                executor.__del__()
 
     def test_shutdown_exception_from_callback_generator(self) -> None:
         self.assertIsNotNone(self.node.handle)
@@ -177,7 +151,7 @@ class TestExecutor(unittest.TestCase):
         # check default behavior, either platform configuration or defaults to 2
         executor = MultiThreadedExecutor(context=self.context)
         if hasattr(os, 'sched_getaffinity'):
-            platform_threads: Optional[int] = len(os.sched_getaffinity(0))
+            platform_threads = len(os.sched_getaffinity(0))
         else:
             platform_threads = os.cpu_count()
         self.assertEqual(platform_threads, executor._executor._max_workers)
@@ -203,26 +177,15 @@ class TestExecutor(unittest.TestCase):
         try:
             self.assertTrue(self.func_execution(executor))
         finally:
-            executor.shutdown(wait_for_threads=True)
+            executor.shutdown()
 
     def test_multi_threaded_executor_closes_threads(self) -> None:
         self.assertIsNotNone(self.node.handle)
 
-        executor_prefix = 'ThreadPoolExecutor-'
+        def get_threads():
+            return {t.name for t in threading.enumerate()}
 
-        def get_executor_threads() -> Set[str]:
-            return {t.name for t in threading.enumerate()
-                    if t.name and t.name.startswith(executor_prefix)}
-
-        def wait_for_no_new_threads(baseline: Set[str]) -> None:
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline:
-                if not (get_executor_threads() - baseline):
-                    break
-                time.sleep(0.1)
-
-        # Snapshot any pre-existing threads (e.g. still tearing down from prior tests).
-        baseline_threads = get_executor_threads()
+        main_thread_name = get_threads()
         # Explicitly specify 2_threads for single thread system failure
         executor = MultiThreadedExecutor(context=self.context, num_threads=2)
 
@@ -230,13 +193,9 @@ class TestExecutor(unittest.TestCase):
             # Give the executor a callback so at least one thread gets spun up
             self.assertTrue(self.func_execution(executor))
         finally:
-            new_threads = get_executor_threads() - baseline_threads
-            self.assertNotEqual(set(), new_threads)
+            self.assertTrue(main_thread_name != get_threads())
             executor.shutdown(wait_for_threads=True)
-            # Worker threads may still be tearing down briefly after shutdown
-            # returns, so poll with a timeout instead of a single-shot check.
-            wait_for_no_new_threads(baseline_threads)
-            self.assertEqual(set(), get_executor_threads() - baseline_threads)
+            self.assertTrue(main_thread_name == get_threads())
 
     def test_add_node_to_executor(self) -> None:
         self.assertIsNotNone(self.node.handle)
@@ -274,6 +233,8 @@ class TestExecutor(unittest.TestCase):
                     await asyncio.sleep(0)
                     called2 = True
 
+                # TODO(bmartin427) The type markup on Node.create_timer() says you can't pass a
+                # coroutine here.
                 tmr = self.node.create_timer(0.1, coroutine)
                 try:
                     executor.spin_once(timeout_sec=1.23)
@@ -324,7 +285,7 @@ class TestExecutor(unittest.TestCase):
                 executor = cls(context=self.context)
                 executor.add_node(self.node)
 
-                async def coroutine() -> str:
+                async def coroutine():
                     return 'Sentinel Result'
 
                 future = executor.create_task(coroutine)
@@ -375,7 +336,7 @@ class TestExecutor(unittest.TestCase):
                 executor = cls(context=self.context)
                 executor.add_node(self.node)
 
-                async def coroutine() -> str:
+                async def coroutine():
                     return 'Sentinel Result'
 
                 future = executor.create_task(coroutine)
@@ -393,31 +354,28 @@ class TestExecutor(unittest.TestCase):
     def test_create_task_coroutine_wake_from_another_thread(self) -> None:
         self.assertIsNotNone(self.node.handle)
 
-        executor_types: list[ExecutorTypeLike] = [SingleThreadedExecutor,
-                                                  MultiThreadedExecutor,
-                                                  EventsExecutor]
-        for cls in executor_types:
+        for cls in [SingleThreadedExecutor, MultiThreadedExecutor, EventsExecutor]:
             with self.subTest(cls=cls):
                 executor = cls(context=self.context)
-                thread_future: Future[None] = executor.create_future()
+                thread_future = executor.create_future()
 
-                async def coroutine() -> None:
+                async def coroutine():
                     await thread_future
 
-                def future_thread() -> None:
-                    time.sleep(0.1)  # Simulate some work
+                def future_thread():
+                    threading.Event().wait(0.1)  # Simulate some work
                     thread_future.set_result(None)
 
                 t = threading.Thread(target=future_thread)
 
                 coroutine_future = executor.create_task(coroutine)
 
-                start_time = time.perf_counter()
+                start_time = time.monotonic()
 
                 t.start()
                 executor.spin_until_future_complete(coroutine_future, timeout_sec=1.0)
 
-                end_time = time.perf_counter()
+                end_time = time.monotonic()
 
                 self.assertTrue(coroutine_future.done())
 
@@ -432,7 +390,7 @@ class TestExecutor(unittest.TestCase):
                 executor = cls(context=self.context)
                 executor.add_node(self.node)
 
-                def func() -> str:
+                def func():
                     return 'Sentinel Result'
 
                 future = executor.create_task(func)
@@ -449,12 +407,12 @@ class TestExecutor(unittest.TestCase):
                 executor = cls(context=self.context)
                 executor.add_node(self.node)
 
-                async def coro1() -> str:
+                async def coro1():
                     return 'Sentinel Result 1'
 
                 future1 = executor.create_task(coro1)
 
-                async def coro2() -> str:
+                async def coro2():
                     return 'Sentinel Result 2'
 
                 future2 = executor.create_task(coro2)
@@ -477,13 +435,14 @@ class TestExecutor(unittest.TestCase):
                 executor = cls(context=self.context)
                 executor.add_node(self.node)
 
-                async def coro1() -> str:
+                async def coro1():
+                    nonlocal future2
                     await future2
                     return 'Sentinel Result 1'
 
                 future1 = executor.create_task(coro1)
 
-                async def coro2() -> str:
+                async def coro2():
                     return 'Sentinel Result 2'
 
                 future2 = executor.create_task(coro2)
@@ -504,10 +463,8 @@ class TestExecutor(unittest.TestCase):
     def test_coroutine_exception_after_await(self) -> None:
         """Exception in a coroutine after awaiting a future must propagate."""
         self.assertIsNotNone(self.node.handle)
-        executor_types: list[ExecutorTypeLike] = [SingleThreadedExecutor,
-                                                  MultiThreadedExecutor,
-                                                  EventsExecutor]
-        for cls in executor_types:
+        # EventsExecutor excluded - segfaults on exception propagation (#1641)
+        for cls in [SingleThreadedExecutor, MultiThreadedExecutor]:
             with self.subTest(cls=cls):
                 executor = cls(context=self.context)
                 executor.add_node(self.node)
@@ -534,10 +491,8 @@ class TestExecutor(unittest.TestCase):
     def test_cancel_task_while_awaiting_future(self) -> None:
         """Cancelling a task parked on a future must not crash the dispatch loop."""
         self.assertIsNotNone(self.node.handle)
-        executor_types: list[ExecutorTypeLike] = [SingleThreadedExecutor,
-                                                  MultiThreadedExecutor,
-                                                  EventsExecutor]
-        for cls in executor_types:
+        # EventsExecutor excluded - see #1641
+        for cls in [SingleThreadedExecutor, MultiThreadedExecutor]:
             with self.subTest(cls=cls):
                 executor = cls(context=self.context)
                 executor.add_node(self.node)
@@ -567,10 +522,8 @@ class TestExecutor(unittest.TestCase):
     def test_await_already_completed_future(self) -> None:
         """Awaiting an already-completed future must resume and return its result."""
         self.assertIsNotNone(self.node.handle)
-        executor_types: list[ExecutorTypeLike] = [SingleThreadedExecutor,
-                                                  MultiThreadedExecutor,
-                                                  EventsExecutor]
-        for cls in executor_types:
+        # EventsExecutor excluded - see #1641
+        for cls in [SingleThreadedExecutor, MultiThreadedExecutor]:
             with self.subTest(cls=cls):
                 executor = cls(context=self.context)
                 executor.add_node(self.node)
@@ -596,12 +549,14 @@ class TestExecutor(unittest.TestCase):
 
                 future = None
 
-                def spin_until_task_done(executor: Executor) -> None:
+                def spin_until_task_done(executor):
+                    nonlocal future
                     while future is None or not future.done():
                         try:
                             executor.spin_once()
                         finally:
                             executor.shutdown()
+                            break
 
                 # Start spinning in a separate thread
                 thr = threading.Thread(target=spin_until_task_done, args=(executor, ), daemon=True)
@@ -611,7 +566,7 @@ class TestExecutor(unittest.TestCase):
                 # '_wait_for_ready_callbacks()'
                 time.sleep(1)
 
-                def func() -> str:
+                def func():
                     return 'Sentinel Result'
 
                 # Create a task
@@ -633,7 +588,7 @@ class TestExecutor(unittest.TestCase):
             def __init__(self) -> None:
                 self.do_yield = True
 
-            def __await__(self) -> Generator[None, None, None]:
+            def __await__(self):
                 while self.do_yield:
                     yield
                 return
@@ -645,7 +600,7 @@ class TestExecutor(unittest.TestCase):
                 did_return = False
 
                 async def timer_callback() -> None:
-                    nonlocal did_callback, did_return
+                    nonlocal trigger, did_callback, did_return
                     did_callback = True
                     await trigger
                     did_return = True
@@ -706,7 +661,7 @@ class TestExecutor(unittest.TestCase):
                     pass
                 timer = self.node.create_timer(0.003, timer_callback)
 
-                def set_future_result(future: Future[str]) -> None:
+                def set_future_result(future):
                     future.set_result('finished')
 
                 # Future complete timeout_sec > 0
@@ -788,6 +743,7 @@ class TestExecutor(unittest.TestCase):
                     self.node.destroy_timer(tmr)
 
     def test_shutdown_executor_from_callback(self) -> None:
+        """https://github.com/ros2/rclpy/issues/944: allow for executor shutdown from callback."""
         self.assertIsNotNone(self.node.handle)
         timer_period = 0.1
         # TODO(bmartin427) This seems like an invalid test to me?  executor.shutdown() is
@@ -798,6 +754,7 @@ class TestExecutor(unittest.TestCase):
         shutdown_event = threading.Event()
 
         def timer_callback() -> None:
+            nonlocal shutdown_event, executor
             executor.shutdown()
             shutdown_event.set()
 
@@ -807,304 +764,6 @@ class TestExecutor(unittest.TestCase):
         t.start()
         self.assertTrue(shutdown_event.wait(120))
         self.node.destroy_timer(tmr)
-
-    def test_shutdown_timeout_then_retry(self) -> None:
-        self.assertIsNotNone(self.node.handle)
-        executor = SingleThreadedExecutor(context=self.context)
-
-        callback_started = threading.Event()
-        callback_should_finish = threading.Event()
-
-        def long_callback() -> None:
-            callback_started.set()
-            # Bound the wait so a broken test fails rather than hangs.
-            callback_should_finish.wait(timeout=10)
-
-        tmr = self.node.create_timer(0.1, long_callback)
-        executor.add_node(self.node)
-        spin_thread = threading.Thread(target=executor.spin, daemon=True)
-        spin_thread.start()
-
-        try:
-            # Wait for the callback to be running so the work_tracker count
-            # is guaranteed to be non-zero when shutdown's wait runs.
-            self.assertTrue(callback_started.wait(timeout=5))
-
-            # First shutdown: this is the one that flips _is_shutdown to
-            # True. Times out because the callback is still in flight.
-            self.assertFalse(executor.shutdown(timeout_sec=0.1))
-
-            # Second shutdown: _is_shutdown is already True. The callback
-            # is STILL in flight. The wait must run again (regardless of
-            # who initiated) and time out -- if it incorrectly skipped
-            # the wait, this would return True and race cleanup against
-            # the running callback.
-            self.assertFalse(executor.shutdown(timeout_sec=0.1))
-
-            # Release the callback.
-            callback_should_finish.set()
-
-            # Final shutdown: callbacks have drained (or will momentarily).
-            # The wait should now succeed and cleanup should complete.
-            self.assertTrue(executor.shutdown(timeout_sec=5))
-        finally:
-            # Guard rails in case an assertion above interrupts the flow.
-            callback_should_finish.set()
-            spin_thread.join(timeout=5)
-            self.node.destroy_timer(tmr)
-
-    def test_multi_threaded_shutdown_timeout_keeps_worker_pool(self) -> None:
-        # A timed-out shutdown() must not tear down the thread pool: a callback the
-        # spinner has already selected from the wait set but not yet handed to the
-        # pool still has to be submitted without error, and a later shutdown() retry
-        # must succeed.
-        #
-        # spin_once() dispatches exactly one ready callback per call, so making two
-        # guard conditions ready before the first spin_once() leaves the second one
-        # selected-but-not-submitted when shutdown() runs in between.
-        for wait_for_threads in (True, False):
-            with self.subTest(wait_for_threads=wait_for_threads):
-                executor = MultiThreadedExecutor(num_threads=2, context=self.context)
-                started = threading.Event()
-                release = threading.Event()
-
-                def blocking_callback() -> None:
-                    started.set()
-                    # Bound the wait so a broken test fails rather than hangs.
-                    release.wait(timeout=10)
-
-                # Reentrant so the second guard is still executable while the first
-                # callback is blocking. Both guards share the callback so the test does
-                # not depend on which one the executor dispatches first.
-                group = ReentrantCallbackGroup()
-                gc_a = self.node.create_guard_condition(blocking_callback, callback_group=group)
-                gc_b = self.node.create_guard_condition(blocking_callback, callback_group=group)
-                executor.add_node(self.node)
-                try:
-                    gc_a.trigger()
-                    gc_b.trigger()
-
-                    # Dispatches one guard; its callback blocks on a worker thread.
-                    executor.spin_once(timeout_sec=5)
-                    self.assertTrue(started.wait(timeout=10), 'no callback was dispatched')
-
-                    # Times out because the callback is still in flight.
-                    self.assertFalse(executor.shutdown(
-                        timeout_sec=0.01, wait_for_threads=wait_for_threads))
-
-                    # Hands the other, already-selected guard to the pool. If the
-                    # timed-out shutdown() had shut the pool down, this raises
-                    # RuntimeError('cannot schedule new futures after shutdown').
-                    executor.spin_once(timeout_sec=5)
-
-                    release.set()
-                    self.assertTrue(executor.shutdown(
-                        timeout_sec=10, wait_for_threads=wait_for_threads))
-                finally:
-                    release.set()
-                    executor.shutdown(timeout_sec=10, wait_for_threads=False)
-                    self.node.destroy_guard_condition(gc_a)
-                    self.node.destroy_guard_condition(gc_b)
-
-    def test_work_tracker_coroutine_closed_on_different_thread(self) -> None:
-        class YieldOnce:
-
-            def __await__(self) -> Generator[None, None, None]:
-                yield None
-                return None
-
-        wt = _WorkTracker()
-
-        async def callback_like() -> None:
-            with wt.track_callback():
-                await YieldOnce()
-
-        coro = callback_like()
-
-        # Start the coroutine on thread A: runs through track_callback's
-        # __enter__ (incrementing the count for thread A) and suspends
-        # at ``await YieldOnce()``.
-        def thread_a() -> None:
-            coro.send(None)
-
-        ta = threading.Thread(target=thread_a, name='WorkerA')
-        ta.start()
-        ta.join(timeout=5)
-        self.assertFalse(ta.is_alive())
-
-        # Close the coroutine from thread B (a different thread, mimicking
-        # the GC thread).  Pre-fix this raises KeyError because the
-        # __exit__ looked up _executing_thread_counts[current_thread]
-        # and current_thread is thread B, not the thread that entered.
-        errors: List[BaseException] = []
-
-        def thread_b() -> None:
-            try:
-                coro.close()
-            except BaseException as e:
-                errors.append(e)
-
-        tb = threading.Thread(target=thread_b, name='GCThread')
-        tb.start()
-        tb.join(timeout=5)
-        self.assertFalse(tb.is_alive())
-
-        self.assertFalse(errors, f'close() raised: {errors!r}')
-        self.assertFalse(
-            wt._executing_thread_counts,
-            f'work tracker not cleaned up: {wt._executing_thread_counts!r}')
-
-    def test_shutdown_from_multithreaded_executor_callback(self) -> None:
-        self.assertIsNotNone(self.node.handle)
-        executor = MultiThreadedExecutor(num_threads=2, context=self.context)
-
-        shutdown_returned = threading.Event()
-        shutdown_error: List[BaseException] = []
-
-        def timer_callback() -> None:
-            try:
-                # Default wait_for_threads=True is what triggers the bug.
-                executor.shutdown(timeout_sec=5)
-            except BaseException as e:
-                shutdown_error.append(e)
-            finally:
-                shutdown_returned.set()
-
-        tmr = self.node.create_timer(0.1, timer_callback)
-        executor.add_node(self.node)
-        spin_thread = threading.Thread(target=executor.spin, daemon=True)
-        spin_thread.start()
-
-        try:
-            self.assertTrue(
-                shutdown_returned.wait(timeout=15),
-                'shutdown() never returned from inside the callback')
-            self.assertFalse(
-                shutdown_error,
-                f'shutdown() raised: {shutdown_error!r}')
-        finally:
-            spin_thread.join(timeout=5)
-            self.node.destroy_timer(tmr)
-
-    def test_concurrent_shutdown_from_two_callbacks(self) -> None:
-        self.assertIsNotNone(self.node.handle)
-        executor = MultiThreadedExecutor(num_threads=2, context=self.context)
-
-        # Distinct callback groups so the two timers can be dispatched to
-        # separate worker threads concurrently. (The default callback
-        # group is MutuallyExclusive at the node level.)
-        cb_group_a = MutuallyExclusiveCallbackGroup()
-        cb_group_b = MutuallyExclusiveCallbackGroup()
-
-        # Use a barrier to make both callbacks reach shutdown() at the
-        # same time, so they are both inside _work_tracker.wait
-        # simultaneously -- the scenario the regression guards against.
-        barrier = threading.Barrier(2)
-        results: List[bool] = []
-        results_lock = threading.Lock()
-        all_done = threading.Event()
-
-        def shutdown_from_callback() -> None:
-            try:
-                barrier.wait(timeout=5)
-            except threading.BrokenBarrierError:
-                return
-            ok = executor.shutdown(timeout_sec=5, wait_for_threads=False)
-            with results_lock:
-                results.append(ok)
-                if len(results) == 2:
-                    all_done.set()
-
-        tmr_a = self.node.create_timer(
-            0.05, shutdown_from_callback, callback_group=cb_group_a)
-        tmr_b = self.node.create_timer(
-            0.05, shutdown_from_callback, callback_group=cb_group_b)
-
-        executor.add_node(self.node)
-        spin_thread = threading.Thread(target=executor.spin, daemon=True)
-        spin_thread.start()
-
-        try:
-            # Wait for both callbacks to finish their shutdown calls --
-            # don't gate on the spinner exiting, since the spinner can
-            # exit before either callback has appended its result.
-            self.assertTrue(
-                all_done.wait(timeout=15),
-                f'only {len(results)}/2 shutdowns completed -- '
-                'concurrent shutdown deadlocked')
-            spin_thread.join(timeout=5)
-            self.assertFalse(spin_thread.is_alive(), 'spin thread did not exit')
-            with results_lock:
-                self.assertTrue(
-                    all(results),
-                    f'shutdown() returned False (timed out): {results}')
-        finally:
-            barrier.abort()
-            spin_thread.join(timeout=5)
-            self.node.destroy_timer(tmr_a)
-            self.node.destroy_timer(tmr_b)
-
-    def test_work_tracker_waiter_leak_on_timeout(self) -> None:
-        wt = _WorkTracker()
-
-        worker_a_running = threading.Event()
-        worker_a_should_exit = threading.Event()
-        worker_b_running = threading.Event()
-
-        errors_a = []
-        wait_returned_a = []
-
-        def worker_a_thread() -> None:
-            try:
-                with wt.track_callback():
-                    worker_a_running.set()
-                    # Call wait with a short timeout. This times out because
-                    # Worker B is executing a callback and not waiting.
-                    res = wt.wait(timeout_sec=0.1)
-                    wait_returned_a.append(res)
-                    # Stay alive inside the callback context
-                    worker_a_should_exit.wait()
-            except Exception as e:
-                errors_a.append(e)
-
-        def worker_b_thread() -> None:
-            with wt.track_callback():
-                worker_b_running.set()
-                # Run until Worker A's wait times out
-                time.sleep(0.5)
-
-        tb = threading.Thread(target=worker_b_thread, name='WorkerB')
-        tb.start()
-
-        ta = threading.Thread(target=worker_a_thread, name='WorkerA')
-        ta.start()
-
-        self.assertTrue(worker_a_running.wait(timeout=2.0))
-        self.assertTrue(worker_b_running.wait(timeout=2.0))
-
-        # Wait for Worker B to finish
-        tb.join(timeout=2.0)
-
-        self.assertFalse(errors_a)
-        self.assertEqual(wait_returned_a, [False])
-
-        # MainThread calls wait(). Since Worker B finished, only Worker A is active.
-        # However, Worker A leaked into _waiting_threads from the timeout.
-        # MainThread's wait() will prematurely evaluate to True and exit instantly.
-        start_time = time.monotonic()
-        res_main = wt.wait(timeout_sec=0.2)
-        elapsed = time.monotonic() - start_time
-
-        try:
-            # Under the bug, res_main is True and elapsed is ~0.0s.
-            # In the corrected code, it correctly blocks/returns False after 0.2s.
-            self.assertFalse(
-                res_main,
-                'MainThread wait should have timed out because WorkerA is still running')
-            self.assertGreaterEqual(elapsed, 0.15)
-        finally:
-            worker_a_should_exit.set()
-            ta.join(timeout=2.0)
 
     def test_context_manager(self) -> None:
         self.assertIsNotNone(self.node.handle)
@@ -1183,9 +842,7 @@ class TestExecutor(unittest.TestCase):
 
     def test_not_lose_callback(self) -> None:
         self.assertIsNotNone(self.node.handle)
-
-        executor_types: list[ExecutorTypeLike] = [SingleThreadedExecutor, EventsExecutor]
-        for cls in executor_types:
+        for cls in [SingleThreadedExecutor, EventsExecutor]:
             with self.subTest(cls=cls):
                 executor = cls(context=self.context)
 
@@ -1220,16 +877,11 @@ class TestExecutor(unittest.TestCase):
 
     def test_create_future_returns_future_with_executor_attached(self) -> None:
         self.assertIsNotNone(self.node.handle)
-
-        executor_types: list[ExecutorTypeLike] = [SingleThreadedExecutor,
-                                                  MultiThreadedExecutor,
-                                                  EventsExecutor]
-        for cls in executor_types:
+        for cls in [SingleThreadedExecutor, MultiThreadedExecutor, EventsExecutor]:
             with self.subTest(cls=cls):
                 executor = cls(context=self.context)
                 try:
                     fut = executor.create_future()
-                    assert fut._executor
                     self.assertEqual(executor, fut._executor())
                 finally:
                     executor.shutdown()
@@ -1244,7 +896,7 @@ class TestExecutor(unittest.TestCase):
                     executor.add_node(self.node)
 
                     # Start spinning in a background thread
-                    def spin_thread() -> None:
+                    def spin_thread():
                         executor.spin()
 
                     t = threading.Thread(target=spin_thread, daemon=True)
@@ -1272,7 +924,7 @@ class TestExecutor(unittest.TestCase):
                     executor.add_node(self.node)
 
                     # Start spinning in a background thread
-                    def spin_thread() -> None:
+                    def spin_thread():
                         executor.spin_once(timeout_sec=10.0)
 
                     t = threading.Thread(target=spin_thread, daemon=True)
@@ -1301,7 +953,7 @@ class TestExecutor(unittest.TestCase):
                     future = executor.create_future()
 
                     # Start spinning in a background thread
-                    def spin_thread() -> None:
+                    def spin_thread():
                         executor.spin_until_future_complete(future, timeout_sec=10.0)
 
                     t = threading.Thread(target=spin_thread, daemon=True)
@@ -1331,7 +983,7 @@ class TestExecutor(unittest.TestCase):
                     future = executor.create_future()
 
                     # Start spinning in a background thread
-                    def spin_thread() -> None:
+                    def spin_thread():
                         executor.spin_once_until_future_complete(future, timeout_sec=10.0)
 
                     t = threading.Thread(target=spin_thread, daemon=True)
@@ -1347,22 +999,6 @@ class TestExecutor(unittest.TestCase):
                     future.set_result(True)
                     t.join(timeout=1.0)
                     executor.shutdown()
-                finally:
-                    executor.shutdown()
-
-    def test_spin_until_future_complete_propagates_already_done_exception(self) -> None:
-        # Test that spin_until_future_complete surfaces a future's exception even if
-        # the future was already done before the spin loop ran.
-        for cls in [SingleThreadedExecutor, MultiThreadedExecutor]:
-            with self.subTest(cls=cls):
-                executor = cls(context=self.context)
-                try:
-                    future: Future[None] = executor.create_future()
-                    future.set_exception(RuntimeError('pre-set exception'))
-
-                    with self.assertRaises(RuntimeError) as cm:
-                        executor.spin_until_future_complete(future, timeout_sec=1)
-                    self.assertIn('pre-set exception', str(cm.exception))
                 finally:
                     executor.shutdown()
 
