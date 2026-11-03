@@ -108,10 +108,15 @@ pybind11_add_module(_rclpy_pybind11
   src/rclpy/type_description_service.cpp
   src/rclpy/utils.cpp
   src/rclpy/wait_set.cpp
+  src/rclpy/wakeup_socket.cpp
 )
 
 if(CMAKE_C_COMPILER_ID MATCHES "Clang" AND NOT APPLE)
   target_link_libraries(_rclpy_pybind11 PRIVATE atomic)
+endif()
+
+if(WIN32)
+  target_link_libraries(_rclpy_pybind11 PRIVATE ws2_32)
 endif()
 
 target_include_directories(_rclpy_pybind11 PRIVATE
@@ -140,9 +145,6 @@ endif()
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
-  # Give cppcheck hints about macro definitions coming from outside this package
-  get_target_property(ament_cmake_cppcheck_ADDITIONAL_INCLUDE_DIRS rcutils::rcutils INTERFACE_INCLUDE_DIRECTORIES)
-  list(APPEND AMENT_LINT_AUTO_EXCLUDE "ament_cmake_cppcheck")
 
   if(Python3_VERSION VERSION_LESS 3.12)
     file(GLOB AMENT_LINT_AUTO_FILE_EXCLUDE
@@ -156,10 +158,6 @@ if(BUILD_TESTING)
 
   find_package(ament_cmake_mypy REQUIRED)
   ament_mypy(AMENT_STRICT)
-
-  find_package(ament_cmake_cppcheck REQUIRED)
-  ament_cppcheck()
-  set_tests_properties(cppcheck PROPERTIES TIMEOUT 420)
 
   find_package(ament_cmake_pytest REQUIRED)
   find_package(rosidl_generator_py REQUIRED)
@@ -180,6 +178,21 @@ if(BUILD_TESTING)
   target_link_libraries(test_python_allocator
     ament_cmake_ros_core::ament_ros_cxx_standard
     pybind11::embed)
+
+  ament_add_gtest(test_rcl_callback_manager
+    test/test_rcl_callback_manager.cpp
+    src/rclpy/events_executor/events_queue.cpp
+    src/rclpy/events_executor/rcl_support.cpp)
+  target_include_directories(test_rcl_callback_manager PRIVATE src/rclpy)
+  target_link_libraries(test_rcl_callback_manager
+    ament_cmake_ros_core::ament_ros_cxx_standard
+    pybind11::embed)
+  # These sources hold pybind11 objects, which pybind11 declares with hidden visibility.
+  # pybind11_add_module() builds them with -fvisibility=hidden; do the same here so the
+  # compiler does not warn about the enclosing types having greater visibility.
+  set_target_properties(test_rcl_callback_manager PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON)
 
   if(NOT _typesupport_impls STREQUAL "")
     # Run each test in its own pytest invocation to isolate any global state in rclpy
@@ -235,6 +248,7 @@ if(BUILD_TESTING)
       test/test_validate_topic_name.py
       test/test_waitable.py
       test/test_wait_for_message.py
+      test/test_wakeup_socket.py
     )
 
     if(Python3_VERSION VERSION_GREATER_EQUAL 3.12)
