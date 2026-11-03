@@ -27,7 +27,7 @@ using pybind11::literals::operator""_a;
 
 namespace rclpy
 {
-Clock::Clock(rcl_clock_type_t clock_type)
+Clock::Clock(int clock_type)
 {
   // Create a client
   rcl_clock_ = std::shared_ptr<rcl_clock_t>(
@@ -36,18 +36,14 @@ Clock::Clock(rcl_clock_type_t clock_type)
     {
       rcl_ret_t ret = rcl_clock_fini(clock);
       if (RCL_RET_OK != ret) {
-        // Warning should use line number of the current stack frame
-        int stack_level = 1;
-        PyErr_WarnFormat(
-          PyExc_RuntimeWarning, stack_level, "Failed to fini client: %s",
-          rcl_get_error_string().str);
-        rcl_reset_error();
+        warn_fini_failure("clock");
       }
       delete clock;
     });
 
+  rcl_clock_type_t rcl_clock_type = rcl_clock_type_t(clock_type);
   rcl_allocator_t allocator = rcl_get_default_allocator();
-  rcl_ret_t ret = rcl_clock_init(clock_type, rcl_clock_.get(), &allocator);
+  rcl_ret_t ret = rcl_clock_init(rcl_clock_type, rcl_clock_.get(), &allocator);
   if (ret != RCL_RET_OK) {
     throw RCLError("failed to initialize clock");
   }
@@ -175,7 +171,7 @@ void Clock::remove_clock_callback(py::object pyjump_handle)
 void define_clock(py::object module)
 {
   py::class_<Clock, Destroyable, std::shared_ptr<Clock>>(module, "Clock")
-  .def(py::init<rcl_clock_type_t>())
+  .def(py::init<int>())
   .def_property_readonly(
     "pointer", [](const Clock & clock) {
       return reinterpret_cast<size_t>(clock.rcl_ptr());

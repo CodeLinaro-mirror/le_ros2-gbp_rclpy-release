@@ -12,52 +12,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TypeVar, Union
+from __future__ import annotations
+
+from collections.abc import Callable
+from types import TracebackType
+from typing import Generic, List, Optional, Type, TypeVar, Union
 
 from rclpy.callback_groups import CallbackGroup
 from rclpy.duration import Duration
+from rclpy.event_handler import EventHandler, PublisherEventCallbacks
 from rclpy.impl.implementation_singleton import rclpy_implementation as _rclpy
 from rclpy.qos import QoSProfile
-from rclpy.qos_event import PublisherEventCallbacks
-from rclpy.qos_event import QoSEventHandler
+from rclpy.type_support import MsgT
 
+from typing_extensions import Self
+
+
+# Left to support Legacy TypeVars.
 MsgType = TypeVar('MsgType')
 
 
-class Publisher:
+class BasePublisher(Generic[MsgT]):
 
     def __init__(
         self,
-        publisher_impl: _rclpy.Publisher,
-        msg_type: MsgType,
+        publisher_impl: '_rclpy.Publisher[MsgT]',
+        msg_type: Type[MsgT],
         topic: str,
         qos_profile: QoSProfile,
-        event_callbacks: PublisherEventCallbacks,
-        callback_group: CallbackGroup,
+        *,
+        on_destroy: Optional[Callable[[Self], None]] = None,
     ) -> None:
         """
         Create a container for a ROS publisher.
 
-        .. warning:: Users should not create a publisher with this constuctor, instead they should
-           call :meth:`.Node.create_publisher`.
-
-        A publisher is used as a primary means of communication in a ROS system by publishing
-        messages on a ROS topic.
-
-        :param publisher_impl: Publisher wrapping the underlying ``rcl_publisher_t`` object.
-        :param msg_type: The type of ROS messages the publisher will publish.
-        :param topic: The name of the topic the publisher will publish to.
-        :param qos_profile: The quality of service profile to apply to the publisher.
+        .. warning:: Users should not create a publisher with this constructor, instead they
+           should call :meth:`.Node.create_publisher` or :meth:`.AsyncNode.create_publisher`.
         """
         self.__publisher = publisher_impl
         self.msg_type = msg_type
         self.topic = topic
         self.qos_profile = qos_profile
+        self._on_destroy = on_destroy
+        self._destroyed = False
 
-        self.event_handlers: QoSEventHandler = event_callbacks.create_event_handlers(
-            callback_group, publisher_impl, topic)
-
-    def publish(self, msg: Union[MsgType, bytes]) -> None:
+    def publish(self, msg: Union[MsgT, bytes]) -> None:
         """
         Send a message to the topic for the publisher.
 
@@ -84,7 +83,7 @@ class Publisher:
             return self.__publisher.get_topic_name()
 
     @property
-    def handle(self):
+    def handle(self) -> '_rclpy.Publisher[MsgT]':
         return self.__publisher
 
     @property
@@ -93,10 +92,18 @@ class Publisher:
         with self.handle:
             return self.__publisher.get_logger_name()
 
-    def destroy(self):
-        for handler in self.event_handlers:
-            handler.destroy()
-        self.__publisher.destroy_when_not_in_use()
+    def destroy(self: Self) -> None:
+        """Destroy the publisher, notifying the owning node and releasing the handle."""
+        if self._destroyed:
+            return
+        self._destroyed = True
+        if self._on_destroy is not None:
+            self._on_destroy(self)
+            self._on_destroy = None
+        self._destroy()
+
+    def _destroy(self) -> None:
+        self.handle.destroy_when_not_in_use()
 
     def assert_liveliness(self) -> None:
         """
@@ -107,6 +114,56 @@ class Publisher:
         """
         with self.handle:
             _rclpy.rclpy_assert_liveliness(self.handle)
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> None:
+        self.destroy()
+
+
+class Publisher(BasePublisher[MsgT], Generic[MsgT]):
+
+    def __init__(
+        self,
+        publisher_impl: '_rclpy.Publisher[MsgT]',
+        msg_type: Type[MsgT],
+        topic: str,
+        qos_profile: QoSProfile,
+        *,
+        on_destroy: Optional[Callable[['Publisher[MsgT]'], None]] = None,
+        event_callbacks: PublisherEventCallbacks,
+        callback_group: CallbackGroup,
+    ) -> None:
+        """
+        Create a container for a ROS publisher.
+
+        .. warning:: Users should not create a publisher with this constructor, instead they should
+           call :meth:`.Node.create_publisher`.
+
+        A publisher is used as a primary means of communication in a ROS system by publishing
+        messages on a ROS topic.
+
+        :param publisher_impl: Publisher wrapping the underlying ``rcl_publisher_t`` object.
+        :param msg_type: The type of ROS messages the publisher will publish.
+        :param topic: The name of the topic the publisher will publish to.
+        :param qos_profile: The quality of service profile to apply to the publisher.
+        """
+        super().__init__(
+            publisher_impl=publisher_impl,
+            msg_type=msg_type,
+            topic=topic,
+            qos_profile=qos_profile,
+        )
+        self._on_destroy = on_destroy
+
+        self.event_handlers: List[EventHandler] = event_callbacks.create_event_handlers(
+            callback_group, publisher_impl, topic)
 
     def wait_for_all_acked(self, timeout: Duration = Duration(seconds=-1)) -> bool:
         """
@@ -126,4 +183,9 @@ class Publisher:
             false.
         """
         with self.handle:
-            return self.__publisher.wait_for_all_acked(timeout._duration_handle)
+            return self.handle.wait_for_all_acked(timeout._duration_handle)
+
+    def _destroy(self) -> None:
+        for handler in self.event_handlers:
+            handler.destroy()
+        super()._destroy()

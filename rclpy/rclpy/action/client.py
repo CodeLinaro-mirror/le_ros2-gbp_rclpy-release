@@ -12,64 +12,131 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import threading
 import time
+from types import TracebackType
+from typing import Any
+from typing import Callable
+from typing import Coroutine
+from typing import Dict
+from typing import Generic
+from typing import Optional
+from typing import Tuple
+from typing import Type
+from typing import TYPE_CHECKING
+from typing import TypedDict
+from typing import TypeVar
+from typing import Union
+
 import uuid
 import weakref
 
 from action_msgs.msg import GoalStatus
+from action_msgs.msg._goal_status_array import GoalStatusArray
 from action_msgs.srv import CancelGoal
+from builtin_interfaces.msg import Time
 
+from rclpy.clock import Clock
 from rclpy.executors import await_or_execute
 from rclpy.impl.implementation_singleton import rclpy_implementation as _rclpy
 from rclpy.qos import qos_profile_action_status_default
 from rclpy.qos import qos_profile_services_default
 from rclpy.qos import QoSProfile
+from rclpy.service_introspection import ServiceIntrospectionState
 from rclpy.task import Future
+from rclpy.type_support import Action
 from rclpy.type_support import check_for_type_support
+from rclpy.type_support import FeedbackMessage
+from rclpy.type_support import FeedbackT
+from rclpy.type_support import GetResultServiceResponse
+from rclpy.type_support import GoalT
+from rclpy.type_support import ImplT
+from rclpy.type_support import Msg
+from rclpy.type_support import ResultT
+from rclpy.type_support import SendGoalServiceResponse
 from rclpy.waitable import NumberOfEntities, Waitable
-
 from unique_identifier_msgs.msg import UUID
 
+if TYPE_CHECKING:
+    from rclpy.callback_groups import CallbackGroup
+    from rclpy.node import Node
+    from typing_extensions import TypeAlias, Unpack
 
-class ClientGoalHandle():
+    ClientGoalHandleDictResultT = TypeVar('ClientGoalHandleDictResultT', bound=Msg)
+    ClientGoalHandleDictFeedbackT = TypeVar('ClientGoalHandleDictFeedbackT', bound=Msg)
+
+    class ClientGoalHandleDict(TypedDict,
+                               Generic[ClientGoalHandleDictResultT, ClientGoalHandleDictFeedbackT],
+                               total=False):
+        goal: Tuple[int, SendGoalServiceResponse]
+        cancel: Tuple[int, CancelGoal.Response]
+        result: Tuple[int, GetResultServiceResponse[ClientGoalHandleDictResultT]]
+        feedback: FeedbackMessage[ClientGoalHandleDictFeedbackT]
+        status: GoalStatusArray
+
+    FeedbackCallbackUnion: TypeAlias = Union[
+        Callable[[FeedbackMessage[FeedbackT]], None],
+        Callable[[FeedbackMessage[FeedbackT]], Coroutine[Any, Any, None]],
+    ]
+
+    class SendGoalKWargs(TypedDict, Generic[FeedbackT]):
+        feedback_callback: Optional[FeedbackCallbackUnion[FeedbackT]]
+        goal_uuid: Optional[UUID]
+else:
+    ClientGoalHandleDict: 'TypeAlias' = Dict[str, object]
+
+
+T = TypeVar('T')
+
+# Re-export exception defined in _rclpy C extension.
+RCLError = _rclpy.RCLError
+
+
+class ClientGoalHandle(Generic[GoalT, ResultT, FeedbackT, ImplT]):
     """Goal handle for working with Action Clients."""
 
-    def __init__(self, action_client, goal_id, goal_response):
+    def __init__(self, action_client: ActionClient[GoalT, ResultT, FeedbackT, ImplT],
+                 goal_id: UUID, goal_response: SendGoalServiceResponse):
         self._action_client = action_client
         self._goal_id = goal_id
         self._goal_response = goal_response
-        self._status = GoalStatus.STATUS_UNKNOWN
+        self._status: int = GoalStatus.STATUS_UNKNOWN
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ClientGoalHandle):
+            return False
         return self._goal_id == other.goal_id
 
-    def __ne__(self, other):
+    def __ne__(self, other: object) -> bool:
+        if not isinstance(other, ClientGoalHandle):
+            return True
         return self._goal_id != other.goal_id
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return 'ClientGoalHandle <id={0}, accepted={1}, status={2}>'.format(
                 self.goal_id.uuid,
                 self.accepted,
                 self.status)
 
     @property
-    def goal_id(self):
+    def goal_id(self) -> UUID:
         return self._goal_id
 
     @property
-    def stamp(self):
+    def stamp(self) -> Time:
         return self._goal_response.stamp
 
     @property
-    def accepted(self):
+    def accepted(self) -> bool:
         return self._goal_response.accepted
 
     @property
-    def status(self):
+    def status(self) -> int:
         return self._status
 
-    def cancel_goal(self):
+    def cancel_goal(self) -> Optional[CancelGoal.Response]:
         """
         Send a cancel request for the goal and wait for the response.
 
@@ -79,7 +146,7 @@ class ClientGoalHandle():
         """
         return self._action_client._cancel_goal(self)
 
-    def cancel_goal_async(self):
+    def cancel_goal_async(self) -> Future[CancelGoal.Response]:
         """
         Asynchronous request for the goal be canceled.
 
@@ -88,7 +155,7 @@ class ClientGoalHandle():
         """
         return self._action_client._cancel_goal_async(self)
 
-    def get_result(self):
+    def get_result(self) -> Optional[GetResultServiceResponse[ResultT]]:
         """
         Request the result for the goal and wait for the response.
 
@@ -98,7 +165,7 @@ class ClientGoalHandle():
         """
         return self._action_client._get_result(self)
 
-    def get_result_async(self):
+    def get_result_async(self) -> Future[GetResultServiceResponse[ResultT]]:
         """
         Asynchronously request the goal result.
 
@@ -108,24 +175,47 @@ class ClientGoalHandle():
         return self._action_client._get_result_async(self)
 
 
-class ActionClient(Waitable):
+class ActionClient(Generic[GoalT, ResultT, FeedbackT, ImplT],
+                   Waitable['ClientGoalHandleDict[ResultT, FeedbackT]']):
     """ROS Action client."""
 
     def __init__(
         self,
-        node,
-        action_type,
-        action_name,
+        node: 'Node',
+        action_type: type[Action[GoalT, ResultT, FeedbackT, ImplT]],
+        action_name: str,
         *,
-        callback_group=None,
-        goal_service_qos_profile=qos_profile_services_default,
-        result_service_qos_profile=qos_profile_services_default,
-        cancel_service_qos_profile=qos_profile_services_default,
-        feedback_sub_qos_profile=QoSProfile(depth=10),
-        status_sub_qos_profile=qos_profile_action_status_default
-    ):
+        callback_group: 'Optional[CallbackGroup]' = None,
+        goal_service_qos_profile: QoSProfile = qos_profile_services_default,
+        result_service_qos_profile: QoSProfile = qos_profile_services_default,
+        cancel_service_qos_profile: QoSProfile = qos_profile_services_default,
+        feedback_sub_qos_profile: QoSProfile = QoSProfile(depth=10),
+        status_sub_qos_profile: QoSProfile = qos_profile_action_status_default,
+        enable_feedback_msg_optimization: bool = False
+    ) -> None:
         """
         Create an ActionClient.
+
+        When multiple action clients connect to the same action server, the subscription for
+        receiving feedback messages inside each action client will first receive all feedback
+        messages, and then determine which feedback belongs to itself based on goal ID. When
+        `enable_feedback_msg_optimization` is set to true, the content filter is used to configure
+        the goal ID for the subscription, which helps avoid the reception of irrelevant feedback
+        messages internally for each action client.
+
+        If `enable_feedback_msg_optimization` is set to true, an action client can handle up to
+        6 goals simultaneously. This optimization takes advantage of the content filter feature.
+        According to the DDS specification, the maximum number of parameters supported by content
+        filter is 100. Configuring one goal ID consumes 16 parameters, so at most, 6 goal IDs can
+        be set simultaneously. If the number of goals exceeds the limit, optimization is
+        automatically disabled. If the rmw implementation doesn't support content filter,
+        optimization is also automatically disabled.
+
+        Even if the RMW implementation supports the content filter feature, different RMW
+        implementations may impose restrictions on the content filter expression. For example,
+        in ConnextDDS, the `RMW_CONNEXT_CONTENTFILTER_PROPERTY_MAX_LENGTH` setting affects the
+        available length of content filter expressions. When this limit is reached, the
+        optimization will be automatically disabled.
 
         :param node: The ROS node to add the action client to.
         :param action_type: Type of the action.
@@ -138,6 +228,8 @@ class ActionClient(Waitable):
         :param cancel_service_qos_profile: QoS profile for the cancel service.
         :param feedback_sub_qos_profile: QoS profile for the feedback subscriber.
         :param status_sub_qos_profile: QoS profile for the status subscriber.
+        :param enable_feedback_msg_optimization: Enable feedback subscription content filter to
+            optimize the handling of feedback messages.
         """
         if callback_group is None:
             callback_group = node.default_callback_group
@@ -150,43 +242,55 @@ class ActionClient(Waitable):
         self._action_type = action_type
         self._action_name = action_name
         with node.handle:
-            self._client_handle = _rclpy.ActionClient(
-                node.handle,
-                action_type,
-                action_name,
-                goal_service_qos_profile.get_c_qos_profile(),
-                result_service_qos_profile.get_c_qos_profile(),
-                cancel_service_qos_profile.get_c_qos_profile(),
-                feedback_sub_qos_profile.get_c_qos_profile(),
-                status_sub_qos_profile.get_c_qos_profile()
-            )
+            self._client_handle =  \
+                _rclpy.ActionClient(
+                    node.handle,
+                    action_type,
+                    action_name,
+                    goal_service_qos_profile.get_c_qos_profile(),
+                    result_service_qos_profile.get_c_qos_profile(),
+                    cancel_service_qos_profile.get_c_qos_profile(),
+                    feedback_sub_qos_profile.get_c_qos_profile(),
+                    status_sub_qos_profile.get_c_qos_profile(),
+                    enable_feedback_msg_optimization
+                )
 
         self._is_ready = False
 
         # key: UUID in bytes, value: weak reference to ClientGoalHandle
-        self._goal_handles = {}
+        self._goal_handles: Dict[bytes,
+                                 weakref.ReferenceType[ClientGoalHandle[GoalT,
+                                                                        ResultT,
+                                                                        FeedbackT,
+                                                                        ImplT]]] = {}
         # key: goal request sequence_number, value: Future for goal response
-        self._pending_goal_requests = {}
+        self._pending_goal_requests: Dict[int, Future[ClientGoalHandle[GoalT,
+                                                                       ResultT,
+                                                                       FeedbackT,
+                                                                       ImplT]]] = {}
         # key: goal request sequence_number, value: UUID
-        self._goal_sequence_number_to_goal_id = {}
+        self._goal_sequence_number_to_goal_id: Dict[int, UUID] = {}
         # key: cancel request sequence number, value: Future for cancel response
-        self._pending_cancel_requests = {}
+        self._pending_cancel_requests: Dict[int, Future[CancelGoal.Response]] = {}
         # key: result request sequence number, value: Future for result response
-        self._pending_result_requests = {}
+        self._pending_result_requests: Dict[int, Future[GetResultServiceResponse[ResultT]]] = {}
         # key: result request sequence_number, value: UUID
-        self._result_sequence_number_to_goal_id = {}
+        self._result_sequence_number_to_goal_id: Dict[int, UUID] = {}
         # key: UUID in bytes, value: callback function
-        self._feedback_callbacks = {}
+        self._feedback_callbacks: Dict[bytes, FeedbackCallbackUnion[FeedbackT]] = {}
+        self._enable_feedback_msg_optimization = enable_feedback_msg_optimization
 
+        self._logger = self._node.get_logger().get_child('action_client')
         self._lock = threading.Lock()
 
         callback_group.add_entity(self)
         self._node.add_waitable(self)
 
-    def _generate_random_uuid(self):
+    def _generate_random_uuid(self) -> UUID:
         return UUID(uuid=list(uuid.uuid4().bytes))
 
-    def _remove_pending_request(self, future, pending_requests):
+    def _remove_pending_request(self, future: Future[T], pending_requests: Dict[int, Future[T]]
+                                ) -> Optional[int]:
         """
         Remove a future from the list of pending requests.
 
@@ -210,15 +314,19 @@ class ActionClient(Waitable):
                     return seq
         return None
 
-    def _remove_pending_goal_request(self, future):
+    def _remove_pending_goal_request(self,
+                                     future: Future[ClientGoalHandle[GoalT, ResultT, FeedbackT,
+                                                                     ImplT]]
+                                     ) -> None:
         seq = self._remove_pending_request(future, self._pending_goal_requests)
         if seq in self._goal_sequence_number_to_goal_id:
             del self._goal_sequence_number_to_goal_id[seq]
 
-    def _remove_pending_cancel_request(self, future):
+    def _remove_pending_cancel_request(self, future: Future[CancelGoal.Response]) -> None:
         self._remove_pending_request(future, self._pending_cancel_requests)
 
-    def _remove_pending_result_request(self, future):
+    def _remove_pending_result_request(self, future: Future[GetResultServiceResponse[ResultT]]
+                                       ) -> None:
         seq = self._remove_pending_request(future, self._pending_result_requests)
         if seq in self._result_sequence_number_to_goal_id:
             goal_uuid = bytes(self._result_sequence_number_to_goal_id[seq].uuid)
@@ -227,8 +335,16 @@ class ActionClient(Waitable):
             if goal_uuid in self._feedback_callbacks:
                 del self._feedback_callbacks[goal_uuid]
 
+            if self._enable_feedback_msg_optimization:
+                # Remove goal ID from feedback subscription content filter
+                try:
+                    _ = self._client_handle.configure_feedback_subscription_filter_remove_goal_id(
+                        goal_uuid)
+                except RCLError as e:
+                    self._logger.warning(f'{e}')
+
     # Start Waitable API
-    def is_ready(self, wait_set):
+    def is_ready(self, wait_set: _rclpy.WaitSet) -> bool:
         """Return True if one or more entities are ready in the wait set."""
         ready_entities = self._client_handle.is_ready(wait_set)
         self._is_feedback_ready = ready_entities[0]
@@ -238,52 +354,52 @@ class ActionClient(Waitable):
         self._is_result_response_ready = ready_entities[4]
         return any(ready_entities)
 
-    def take_data(self):
+    def take_data(self) -> 'ClientGoalHandleDict[ResultT, FeedbackT]':
         """Take stuff from lower level so the wait set doesn't immediately wake again."""
-        data = {}
+        data: 'ClientGoalHandleDict[ResultT, FeedbackT]' = {}
         if self._is_goal_response_ready:
             with self._lock:
-                taken_data = self._client_handle.take_goal_response(
+                taken_goal_data = self._client_handle.take_goal_response(
                     self._action_type.Impl.SendGoalService.Response)
                 # If take fails, then we get (None, None)
-                if all(taken_data):
-                    data['goal'] = taken_data
+                if taken_goal_data[0]:
+                    data['goal'] = taken_goal_data
 
         if self._is_cancel_response_ready:
             with self._lock:
-                taken_data = self._client_handle.take_cancel_response(
+                taken_cancel_data = self._client_handle.take_cancel_response(
                     self._action_type.Impl.CancelGoalService.Response)
                 # If take fails, then we get (None, None)
-                if all(taken_data):
-                    data['cancel'] = taken_data
+                if taken_cancel_data[0]:
+                    data['cancel'] = taken_cancel_data
 
         if self._is_result_response_ready:
             with self._lock:
-                taken_data = self._client_handle.take_result_response(
+                taken_result_data = self._client_handle.take_result_response(
                     self._action_type.Impl.GetResultService.Response)
                 # If take fails, then we get (None, None)
-                if all(taken_data):
-                    data['result'] = taken_data
+                if taken_result_data[0]:
+                    data['result'] = taken_result_data
 
         if self._is_feedback_ready:
             with self._lock:
-                taken_data = self._client_handle.take_feedback(
+                taken_feedback_data = self._client_handle.take_feedback(
                     self._action_type.Impl.FeedbackMessage)
                 # If take fails, then we get None
-                if taken_data is not None:
-                    data['feedback'] = taken_data
+                if taken_feedback_data is not None:
+                    data['feedback'] = taken_feedback_data
 
         if self._is_status_ready:
             with self._lock:
-                taken_data = self._client_handle.take_status(
+                taken_status_data = self._client_handle.take_status(
                     self._action_type.Impl.GoalStatusMessage)
                 # If take fails, then we get None
-                if taken_data is not None:
-                    data['status'] = taken_data
+                if taken_status_data is not None:
+                    data['status'] = taken_status_data
 
         return data
 
-    async def execute(self, taken_data):
+    async def execute(self, taken_data: 'ClientGoalHandleDict[ResultT, FeedbackT]') -> None:
         """
         Execute work after data has been taken from a ready wait set.
 
@@ -304,10 +420,16 @@ class ActionClient(Waitable):
                         raise RuntimeError(
                             'Two goals were accepted with the same ID ({})'.format(goal_handle))
                     self._goal_handles[goal_uuid] = weakref.ref(goal_handle)
+                    if (self._enable_feedback_msg_optimization):
+                        try:
+                            _ = self._client_handle \
+                                .configure_feedback_subscription_filter_add_goal_id(goal_uuid)
+                        except RCLError as e:
+                            self._logger.warning(f'{e}')
 
                 self._pending_goal_requests[sequence_number].set_result(goal_handle)
             else:
-                self._node.get_logger().warning(
+                self._logger.warning(
                     'Ignoring unexpected goal response. There may be more than '
                     f"one action server for the action '{self._action_name}'"
                 )
@@ -317,7 +439,7 @@ class ActionClient(Waitable):
             if sequence_number in self._pending_cancel_requests:
                 self._pending_cancel_requests[sequence_number].set_result(cancel_response)
             else:
-                self._node.get_logger().warning(
+                self._logger.warning(
                     'Ignoring unexpected cancel response. There may be more than '
                     f"one action server for the action '{self._action_name}'"
                 )
@@ -327,7 +449,7 @@ class ActionClient(Waitable):
             if sequence_number in self._pending_result_requests:
                 self._pending_result_requests[sequence_number].set_result(result_response)
             else:
-                self._node.get_logger().warning(
+                self._logger.warning(
                     'Ignoring unexpected result response. There may be more than '
                     f"one action server for the action '{self._action_name}'"
                 )
@@ -346,38 +468,47 @@ class ActionClient(Waitable):
                 status = status_msg.status
 
                 if goal_uuid in self._goal_handles:
-                    goal_handle = self._goal_handles[goal_uuid]()
-                    if goal_handle is not None:
-                        goal_handle._status = status
+                    status_goal_handle = self._goal_handles[goal_uuid]()
+                    if status_goal_handle is not None:
+                        status_goal_handle._status = status
                         # Remove "done" goals from the list
                         if (GoalStatus.STATUS_SUCCEEDED == status or
                                 GoalStatus.STATUS_CANCELED == status or
                                 GoalStatus.STATUS_ABORTED == status):
                             del self._goal_handles[goal_uuid]
+                            if self._enable_feedback_msg_optimization:
+                                try:
+                                    _ = self._client_handle \
+                                        .configure_feedback_subscription_filter_remove_goal_id(
+                                            goal_uuid)
+                                except RCLError as e:
+                                    self._logger.warning(f'{e}')
                     else:
                         # Weak reference is None
                         del self._goal_handles[goal_uuid]
 
-    def get_num_entities(self):
+    def get_num_entities(self) -> NumberOfEntities:
         """Return number of each type of entity used in the wait set."""
         with self._lock:
             num_entities = self._client_handle.get_num_entities()
         return NumberOfEntities(*num_entities)
 
-    def add_to_wait_set(self, wait_set):
+    def add_to_wait_set(self, wait_set: _rclpy.WaitSet) -> None:
         """Add entities to wait set."""
         with self._lock:
             self._client_handle.add_to_waitset(wait_set)
 
-    def __enter__(self):
-        return self._client_handle.__enter__()
+    def __enter__(self) -> None:
+        self._client_handle.__enter__()
 
-    def __exit__(self, t, v, tb):
+    def __exit__(self, t: Optional[Type[BaseException]], v: Optional[BaseException],
+                 tb: Optional[TracebackType]) -> None:
         self._client_handle.__exit__(t, v, tb)
 
     # End Waitable API
 
-    def send_goal(self, goal, **kwargs):
+    def send_goal(self, goal: GoalT, **kwargs: 'Unpack[SendGoalKWargs[FeedbackT]]'
+                  ) -> Optional[GetResultServiceResponse[ResultT]]:
         """
         Send a goal and wait for the result.
 
@@ -397,28 +528,37 @@ class ActionClient(Waitable):
           constructed.
         """
         if not isinstance(goal, self._action_type.Goal):
-            raise TypeError()
+            raise TypeError(
+                f'Expected goal type ({type(self._action_type.Goal)}) but received ({type(goal)})')
 
         event = threading.Event()
 
-        def unblock(future):
-            nonlocal event
+        def unblock(future: Future[Any]) -> None:
             event.set()
 
         send_goal_future = self.send_goal_async(goal, **kwargs)
         send_goal_future.add_done_callback(unblock)
 
         event.wait()
-        if send_goal_future.exception() is not None:
-            raise send_goal_future.exception()
+        exception = send_goal_future.exception()
+        if exception is not None:
+            raise exception
 
         goal_handle = send_goal_future.result()
 
+        if not isinstance(goal_handle, ClientGoalHandle):
+            raise TypeError(
+                'Expected type ClientGoalHandle but received {}'.format(type(goal_handle)))
         result = self._get_result(goal_handle)
 
         return result
 
-    def send_goal_async(self, goal, feedback_callback=None, goal_uuid=None):
+    def send_goal_async(
+        self,
+        goal: GoalT,
+        feedback_callback: Optional[FeedbackCallbackUnion[FeedbackT]] = None,
+        goal_uuid: Optional[UUID] = None
+    ) -> Future[ClientGoalHandle[GoalT, ResultT, FeedbackT, ImplT]]:
         """
         Send a goal and asynchronously get the result.
 
@@ -440,12 +580,13 @@ class ActionClient(Waitable):
           constructed.
         """
         if not isinstance(goal, self._action_type.Goal):
-            raise TypeError()
+            raise TypeError(
+                f'Expected goal type ({type(self._action_type.Goal)}) but received ({type(goal)})')
 
         request = self._action_type.Impl.SendGoalService.Request()
         request.goal_id = self._generate_random_uuid() if goal_uuid is None else goal_uuid
         request.goal = goal
-        future = Future()
+        future: Future[ClientGoalHandle[GoalT, ResultT, FeedbackT, ImplT]] = Future()
         with self._lock:
             sequence_number = self._client_handle.send_goal_request(request)
             if sequence_number in self._pending_goal_requests:
@@ -459,12 +600,13 @@ class ActionClient(Waitable):
 
         if feedback_callback is not None:
             # TODO(jacobperron): Move conversion function to a general-use package
-            goal_uuid = bytes(request.goal_id.uuid)
-            self._feedback_callbacks[goal_uuid] = feedback_callback
+            goal_uuid_bytes = bytes(request.goal_id.uuid)
+            self._feedback_callbacks[goal_uuid_bytes] = feedback_callback
 
         return future
 
-    def _cancel_goal(self, goal_handle):
+    def _cancel_goal(self, goal_handle: ClientGoalHandle[GoalT, ResultT, FeedbackT, ImplT]
+                     ) -> Optional[CancelGoal.Response]:
         """
         Send a cancel request for an active goal and wait for the response.
 
@@ -476,19 +618,22 @@ class ActionClient(Waitable):
         """
         event = threading.Event()
 
-        def unblock(future):
-            nonlocal event
+        def unblock(future: Future[Any]) -> None:
             event.set()
 
         future = self._cancel_goal_async(goal_handle)
         future.add_done_callback(unblock)
 
         event.wait()
-        if future.exception() is not None:
-            raise future.exception()
+        exception = future.exception()
+        if exception is not None:
+            raise exception
         return future.result()
 
-    def _cancel_goal_async(self, goal_handle):
+    def _cancel_goal_async(
+        self,
+        goal_handle: ClientGoalHandle[GoalT, ResultT, FeedbackT, ImplT]
+    ) -> Future[CancelGoal.Response]:
         """
         Send a cancel request for an active goal and asynchronously get the result.
 
@@ -514,14 +659,20 @@ class ActionClient(Waitable):
             future.add_done_callback(self._remove_pending_cancel_request)
             # Add future so executor is aware
             self.add_future(future)
-        self._pending_cancel_requests[sequence_number] = future
-        future.add_done_callback(self._remove_pending_cancel_request)
-        # Add future so executor is aware
-        self.add_future(future)
+
+        if self._enable_feedback_msg_optimization:
+            # Remove goal ID from feedback subscription content filter
+            goal_uuid = bytes(goal_handle.goal_id.uuid)
+            try:
+                _ = self._client_handle.configure_feedback_subscription_filter_remove_goal_id(
+                    goal_uuid)
+            except RCLError as e:
+                self._logger.warning(f'{e}')
 
         return future
 
-    def _get_result(self, goal_handle):
+    def _get_result(self, goal_handle: ClientGoalHandle[GoalT, ResultT, FeedbackT, ImplT]
+                    ) -> Optional[GetResultServiceResponse[ResultT]]:
         """
         Request the result for an active goal and wait for the response.
 
@@ -533,19 +684,20 @@ class ActionClient(Waitable):
         """
         event = threading.Event()
 
-        def unblock(future):
-            nonlocal event
+        def unblock(future: Future[Any]) -> None:
             event.set()
 
         future = self._get_result_async(goal_handle)
         future.add_done_callback(unblock)
 
         event.wait()
-        if future.exception() is not None:
-            raise future.exception()
+        exception = future.exception()
+        if exception is not None:
+            raise exception
         return future.result()
 
-    def _get_result_async(self, goal_handle):
+    def _get_result_async(self, goal_handle: ClientGoalHandle[GoalT, ResultT, FeedbackT, ImplT]
+                          ) -> Future[GetResultServiceResponse[ResultT]]:
         """
         Request the result for an active goal asynchronously.
 
@@ -560,7 +712,7 @@ class ActionClient(Waitable):
 
         result_request = self._action_type.Impl.GetResultService.Request()
         result_request.goal_id = goal_handle.goal_id
-        future = Future()
+        future: Future[GetResultServiceResponse[ResultT]] = Future()
         with self._lock:
             sequence_number = self._client_handle.send_result_request(result_request)
             if sequence_number in self._pending_result_requests:
@@ -575,7 +727,7 @@ class ActionClient(Waitable):
 
         return future
 
-    def server_is_ready(self):
+    def server_is_ready(self) -> bool:
         """
         Check if there is an action server ready to process requests from this client.
 
@@ -584,7 +736,7 @@ class ActionClient(Waitable):
         with self._node.handle:
             return self._client_handle.is_action_server_available()
 
-    def wait_for_server(self, timeout_sec=None):
+    def wait_for_server(self, timeout_sec: Optional[float] = None) -> bool:
         """
         Wait for an action sever to be ready.
 
@@ -605,7 +757,25 @@ class ActionClient(Waitable):
 
         return self.server_is_ready()
 
-    def destroy(self):
+    def configure_introspection(
+        self, clock: Clock,
+        service_event_qos_profile: QoSProfile,
+        introspection_state: ServiceIntrospectionState
+    ) -> None:
+        """
+        Configure action client introspection.
+
+        :param clock: Clock to use for generating timestamps.
+        :param service_event_qos_profile: QoSProfile to use when creating service event publisher.
+        :param introspection_state: ServiceIntrospectionState to set introspection.
+        """
+        with self._client_handle:
+            self._client_handle.configure_introspection(clock.handle,
+                                                        service_event_qos_profile
+                                                        .get_c_qos_profile(),
+                                                        introspection_state)
+
+    def destroy(self) -> None:
         """Destroy the underlying action client handle."""
         self._client_handle.destroy_when_not_in_use()
         self._node.remove_waitable(self)

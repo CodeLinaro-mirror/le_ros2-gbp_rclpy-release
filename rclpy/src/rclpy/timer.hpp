@@ -16,10 +16,10 @@
 #define RCLPY__TIMER_HPP_
 
 #include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
 
 #include <rcl/timer.h>
 
+#include <functional>
 #include <memory>
 #include <optional>
 
@@ -46,9 +46,10 @@ public:
    * \param[in] clock pycapsule containing an rcl_clock_t
    * \param[in] context Capsule for an rcl_timer_t
    * \param[in] period_nsec The period of the timer in nanoseconds
+   * \param[in] autostart Whether to automatically start the timer
    * \return a timer capsule
    */
-  Timer(Clock & clock, Context & context, int64_t period_nsec);
+  Timer(Clock & clock, Context & context, int64_t period_nsec, bool autostart);
 
   ~Timer() = default;
 
@@ -72,6 +73,15 @@ public:
    *
    */
   void call_timer();
+
+  /// Same as call_timer() except that it also retrieves the actual and expected call time.
+  /**
+   * Raises RCLError if there is an rcl error
+   *
+   * \return the actual and expected call time.
+   */
+  py::object
+  call_timer_with_info();
 
   /// Update the timer period
   /**
@@ -135,10 +145,20 @@ public:
   /// Force an early destruction of this object
   void destroy() override;
 
+  void
+  set_on_reset_callback(std::function<void(size_t)> callback);
+
+  void
+  clear_on_reset_callback();
+
 private:
   Context context_;
   Clock clock_;
+  std::function<void(size_t)> on_reset_callback_{nullptr};
   std::shared_ptr<rcl_timer_t> rcl_timer_;
+
+  void
+  set_callback(rcl_event_callback_t callback, const void * user_data);
 };
 
 /// Define a pybind11 wrapper for an rcl_timer_t

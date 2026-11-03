@@ -12,14 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
+from __future__ import annotations
 
+from abc import ABC, abstractmethod
+import math
+import time
+
+from types import TracebackType
 from typing import Any
 from typing import Callable
 from typing import Dict
+from typing import Final
 from typing import Iterator
 from typing import List
+from typing import Literal
 from typing import Optional
+from typing import overload
 from typing import Sequence
 from typing import Tuple
 from typing import Type
@@ -31,21 +39,26 @@ import weakref
 
 from rcl_interfaces.msg import FloatingPointRange
 from rcl_interfaces.msg import IntegerRange
+from rcl_interfaces.msg import ListParametersResult
 from rcl_interfaces.msg import Parameter as ParameterMsg
 from rcl_interfaces.msg import ParameterDescriptor
 from rcl_interfaces.msg import ParameterEvent
 from rcl_interfaces.msg import ParameterType
 from rcl_interfaces.msg import ParameterValue
 from rcl_interfaces.msg import SetParametersResult
+from rcl_interfaces.srv import ListParameters
 
 from rclpy.callback_groups import CallbackGroup
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.client import Client
-from rclpy.clock import Clock
-from rclpy.clock import ROSClock
+from rclpy.clock import BaseClock, Clock
+from rclpy.clock_type import ClockType
 from rclpy.constants import S_TO_NS
 from rclpy.context import Context
+from rclpy.endpoint_info import ActionEndpointInfo, ServiceEndpointInfo, TopicEndpointInfo
+from rclpy.event_handler import PublisherEventCallbacks
+from rclpy.event_handler import SubscriptionEventCallbacks
 from rclpy.exceptions import InvalidHandle
 from rclpy.exceptions import InvalidParameterTypeException
 from rclpy.exceptions import InvalidParameterValueException
@@ -58,26 +71,39 @@ from rclpy.exceptions import ParameterUninitializedException
 from rclpy.executors import Executor
 from rclpy.expand_topic_name import expand_topic_name
 from rclpy.guard_condition import GuardCondition
+from rclpy.guard_condition import GuardConditionCallbackType
 from rclpy.impl.implementation_singleton import rclpy_implementation as _rclpy
+from rclpy.impl.rcutils_logger import RcutilsLogger
 from rclpy.logging import get_logger
-from rclpy.parameter import Parameter, PARAMETER_SEPARATOR_STRING
+from rclpy.logging_service import LoggingService
+from rclpy.parameter import (AllowableParameterValue, AllowableParameterValueT, Parameter,
+                             PARAMETER_SEPARATOR_STRING)
 from rclpy.parameter_service import ParameterService
-from rclpy.publisher import Publisher
+from rclpy.publisher import BasePublisher, Publisher
 from rclpy.qos import qos_profile_parameter_events
+from rclpy.qos import qos_profile_rosout_default
 from rclpy.qos import qos_profile_services_default
 from rclpy.qos import QoSProfile
-from rclpy.qos_event import PublisherEventCallbacks
-from rclpy.qos_event import SubscriptionEventCallbacks
 from rclpy.qos_overriding_options import _declare_qos_parameters
 from rclpy.qos_overriding_options import QoSOverridingOptions
+from rclpy.service import BaseService
 from rclpy.service import Service
+from rclpy.service import ServiceCallbackUnion
+from rclpy.subscription import BaseSubscription, GenericSubscriptionCallbackUnion
 from rclpy.subscription import Subscription
+from rclpy.subscription import SubscriptionCallbackUnion
+from rclpy.subscription_content_filter_options import ContentFilterOptions
 from rclpy.time_source import TimeSource
 from rclpy.timer import Rate
 from rclpy.timer import Timer
-from rclpy.topic_endpoint_info import TopicEndpointInfo
+from rclpy.timer import TimerCallbackUnion
+from rclpy.type_description_service import TypeDescriptionService
 from rclpy.type_support import check_is_valid_msg_type
 from rclpy.type_support import check_is_valid_srv_type
+from rclpy.type_support import MsgT
+from rclpy.type_support import Srv
+from rclpy.type_support import SrvRequestT
+from rclpy.type_support import SrvResponseT
 from rclpy.utilities import get_default_context
 from rclpy.validate_full_topic_name import validate_full_topic_name
 from rclpy.validate_namespace import validate_namespace
@@ -85,27 +111,26 @@ from rclpy.validate_node_name import validate_node_name
 from rclpy.validate_parameter_name import validate_parameter_name
 from rclpy.validate_topic_name import validate_topic_name
 from rclpy.waitable import Waitable
+from typing_extensions import TypeAlias
 
-HIDDEN_NODE_PREFIX = '_'
 
-# Used for documentation purposes only
+HIDDEN_NODE_PREFIX: Final = '_'
+
+# Left to support Legacy TypeVar.
 MsgType = TypeVar('MsgType')
+
 SrvType = TypeVar('SrvType')
 SrvTypeRequest = TypeVar('SrvTypeRequest')
 SrvTypeResponse = TypeVar('SrvTypeResponse')
 
 # Re-export exception defined in _rclpy C extension.
 # `Node.get_*_names_and_types_by_node` methods may raise this error.
-NodeNameNonExistentError = _rclpy.NodeNameNonExistentError
+NodeNameNonExistentError: TypeAlias = _rclpy.NodeNameNonExistentError
+
+ParameterInput: TypeAlias = Union[AllowableParameterValue, Parameter.Type, ParameterValue]
 
 
-class Node:
-    """
-    A Node in the ROS graph.
-
-    A Node is the primary entrypoint in a ROS system for communication.
-    It can be used to create ROS entities such as publishers, subscribers, services, etc.
-    """
+class BaseNode(ABC):
 
     PARAM_REL_TOL = 1e-6
     """
@@ -122,54 +147,37 @@ class Node:
         namespace: Optional[str] = None,
         use_global_arguments: bool = True,
         enable_rosout: bool = True,
+        rosout_qos_profile: Union[QoSProfile, int] = qos_profile_rosout_default,
         start_parameter_services: bool = True,
-        parameter_overrides: Optional[List[Parameter]] = None,
+        parameter_overrides: Optional[List[Parameter[Any]]] = None,
         allow_undeclared_parameters: bool = False,
-        automatically_declare_parameters_from_overrides: bool = False
+        automatically_declare_parameters_from_overrides: bool = False,
+        enable_logger_service: bool = False,
     ) -> None:
         """
-        Create a Node.
+        Create a ROS node.
 
-        :param node_name: A name to give to this node. Validated by :func:`validate_node_name`.
-        :param context: The context to be associated with, or ``None`` for the default global
-            context.
-        :param cli_args: A list of strings of command line args to be used only by this node.
-            These arguments are used to extract remappings used by the node and other ROS specific
-            settings, as well as user defined non-ROS arguments.
-        :param namespace: The namespace to which relative topic and service names will be prefixed.
-            Validated by :func:`validate_namespace`.
-        :param use_global_arguments: ``False`` if the node should ignore process-wide command line
-            args.
-        :param enable_rosout: ``False`` if the node should ignore rosout logging.
-        :param start_parameter_services: ``False`` if the node should not create parameter
-            services.
-        :param parameter_overrides: A list of overrides for initial values for parameters declared
-            on the node.
-        :param allow_undeclared_parameters: True if undeclared parameters are allowed.
-            This flag affects the behavior of parameter-related operations.
-        :param automatically_declare_parameters_from_overrides: If True, the "parameter overrides"
-            will be used to implicitly declare parameters on the node during creation.
+        .. warning:: Users should not create a node with this constructor, instead they
+           should instantiate :class:`.Node` or :class:`.AsyncNode` directly.
         """
-        self.__handle = None
         self._context = get_default_context() if context is None else context
-        self._parameters: dict = {}
-        self._publishers: List[Publisher] = []
-        self._subscriptions: List[Subscription] = []
-        self._clients: List[Client] = []
-        self._services: List[Service] = []
-        self._timers: List[Timer] = []
-        self._guards: List[GuardCondition] = []
-        self.__waitables: List[Waitable] = []
-        self._default_callback_group = MutuallyExclusiveCallbackGroup()
-        self._parameters_callbacks: List[Callable[[List[Parameter]], SetParametersResult]] = []
-        self._rate_group = ReentrantCallbackGroup()
+        self._parameters: Dict[str, Parameter[Any]] = {}
+        self._pre_set_parameters_callbacks: List[Callable[[List[Parameter[Any]]],
+                                                          List[Parameter[Any]]]] = []
+        self._on_set_parameters_callbacks: \
+            List[Callable[[List[Parameter[Any]]], SetParametersResult]] = []
+        self._post_set_parameters_callbacks: List[Callable[[List[Parameter[Any]]], None]] = []
         self._allow_undeclared_parameters = allow_undeclared_parameters
-        self._parameter_overrides = {}
-        self._descriptors = {}
+        self._parameter_overrides: Dict[str, Parameter[Any]] = {}
+        self._descriptors: Dict[str, ParameterDescriptor] = {}
 
         namespace = namespace or ''
-        if not self._context.ok():
+
+        if self._context.handle is None or not self._context.ok():
             raise NotInitializedException('cannot create node')
+
+        rosout_qos_profile = self._validate_qos_or_depth_parameter(rosout_qos_profile)
+
         with self._context.handle:
             try:
                 self.__node = _rclpy.Node(
@@ -178,7 +186,8 @@ class Node:
                     self._context.handle,
                     cli_args,
                     use_global_arguments,
-                    enable_rosout
+                    enable_rosout,
+                    rosout_qos_profile.get_c_qos_profile()
                 )
             except ValueError:
                 # these will raise more specific errors if the name or namespace is bad
@@ -191,23 +200,20 @@ class Node:
                 validate_namespace(namespace)
                 # Should not get to this point
                 raise RuntimeError('rclpy_create_node failed for unknown reason')
+
         with self.handle:
             self._logger = get_logger(self.__node.logger_name())
 
-        self.__executor_weakref = None
-
-        self._parameter_event_publisher = self.create_publisher(
-            ParameterEvent, '/parameter_events', qos_profile_parameter_events)
+        self._parameter_event_publisher: Optional[BasePublisher[ParameterEvent]] = \
+            self.create_publisher(ParameterEvent, '/parameter_events',
+                                  qos_profile_parameter_events)
 
         with self.handle:
-            self._parameter_overrides = self.__node.get_parameters(Parameter)
+            self._parameter_overrides = self.handle.get_parameters(Parameter)
         # Combine parameters from params files with those from the node constructor and
         # use the set_parameters_atomically API so a parameter event is published.
         if parameter_overrides is not None:
             self._parameter_overrides.update({p.name: p for p in parameter_overrides})
-
-        # Clock that has support for ROS time.
-        self._clock = ROSClock()
 
         if automatically_declare_parameters_from_overrides:
             self.declare_parameters(
@@ -222,71 +228,17 @@ class Node:
         # Note: parameter overrides and parameter event publisher need to be ready at this point
         # to be able to declare 'use_sim_time' if it was not declared yet.
         self._time_source = TimeSource(node=self)
-        self._time_source.attach_clock(self._clock)
+        self._time_source.attach_clock(self.get_clock())
 
         if start_parameter_services:
             self._parameter_service = ParameterService(self)
 
-    @property
-    def publishers(self) -> Iterator[Publisher]:
-        """Get publishers that have been created on this node."""
-        yield from self._publishers
+        if enable_logger_service:
+            self._logger_service = LoggingService(self)
 
-    @property
-    def subscriptions(self) -> Iterator[Subscription]:
-        """Get subscriptions that have been created on this node."""
-        yield from self._subscriptions
+        self._type_description_service = TypeDescriptionService(self)
 
-    @property
-    def clients(self) -> Iterator[Client]:
-        """Get clients that have been created on this node."""
-        yield from self._clients
-
-    @property
-    def services(self) -> Iterator[Service]:
-        """Get services that have been created on this node."""
-        yield from self._services
-
-    @property
-    def timers(self) -> Iterator[Timer]:
-        """Get timers that have been created on this node."""
-        yield from self._timers
-
-    @property
-    def guards(self) -> Iterator[GuardCondition]:
-        """Get guards that have been created on this node."""
-        yield from self._guards
-
-    @property
-    def waitables(self) -> Iterator[Waitable]:
-        """Get waitables that have been created on this node."""
-        yield from self.__waitables
-
-    @property
-    def executor(self) -> Optional[Executor]:
-        """Get the executor if the node has been added to one, else return ``None``."""
-        if self.__executor_weakref:
-            return self.__executor_weakref()
-        return None
-
-    @executor.setter
-    def executor(self, new_executor: Executor) -> None:
-        """Set or change the executor the node belongs to."""
-        current_executor = self.executor
-        if current_executor == new_executor:
-            return
-        if current_executor is not None:
-            current_executor.remove_node(self)
-        if new_executor is None:
-            self.__executor_weakref = None
-        else:
-            new_executor.add_node(self)
-            self.__executor_weakref = weakref.ref(new_executor)
-
-    def _wake_executor(self):
-        executor = self.executor
-        if executor:
-            executor.wake()
+        self._context.track_node(self)
 
     @property
     def context(self) -> Context:
@@ -294,17 +246,7 @@ class Node:
         return self._context
 
     @property
-    def default_callback_group(self) -> CallbackGroup:
-        """
-        Get the default callback group.
-
-        If no other callback group is provided when the a ROS entity is created with the node,
-        then it is added to the default callback group.
-        """
-        return self._default_callback_group
-
-    @property
-    def handle(self):
+    def handle(self) -> _rclpy.Node:
         """
         Get the handle to the underlying `rcl_node_t`.
 
@@ -315,7 +257,7 @@ class Node:
         return self.__node
 
     @handle.setter
-    def handle(self, value):
+    def handle(self, value: None) -> None:
         raise AttributeError('handle cannot be modified after node creation')
 
     def get_name(self) -> str:
@@ -328,26 +270,84 @@ class Node:
         with self.handle:
             return self.handle.get_namespace()
 
-    def get_clock(self) -> Clock:
-        """Get the clock used by the node."""
-        return self._clock
+    @abstractmethod
+    def get_clock(self) -> BaseClock:
+        ...
 
-    def get_logger(self):
+    @abstractmethod
+    def create_publisher(
+        self,
+        msg_type: Type[MsgT],
+        topic: str,
+        qos_profile: Union[QoSProfile, int],
+    ) -> BasePublisher[MsgT]:
+        ...
+
+    @abstractmethod
+    def create_subscription(
+        self,
+        msg_type: Type[MsgT],
+        topic: str,
+        callback: SubscriptionCallbackUnion[MsgT],
+        qos_profile: Union[QoSProfile, int],
+    ) -> BaseSubscription[MsgT]:
+        ...
+
+    @abstractmethod
+    def create_service(
+        self,
+        srv_type: type[Srv[SrvRequestT, SrvResponseT]],
+        srv_name: str,
+        callback: ServiceCallbackUnion[SrvRequestT, SrvResponseT],
+        *,
+        qos_profile: QoSProfile = qos_profile_services_default,
+    ) -> BaseService[SrvRequestT, SrvResponseT]:
+        ...
+
+    @abstractmethod
+    def _create_service(
+        self,
+        service_impl: '_rclpy.Service[SrvRequestT, SrvResponseT]',
+        srv_type: type[Srv[SrvRequestT, SrvResponseT]],
+        srv_name: str,
+        callback: ServiceCallbackUnion[SrvRequestT, SrvResponseT],
+        qos_profile: QoSProfile,
+    ) -> BaseService[SrvRequestT, SrvResponseT]:
+        ...
+
+    def get_logger(self) -> RcutilsLogger:
         """Get the nodes logger."""
         return self._logger
 
-    def declare_parameter(
+    # Overloads needed due to mypy #3737
+    @overload
+    def declare_parameter(self, name: str, value: AllowableParameterValueT,
+                          descriptor: Optional[ParameterDescriptor] = None,
+                          ignore_override: bool = False
+                          ) -> Parameter[AllowableParameterValueT]: ...
+
+    @overload
+    def declare_parameter(self, name: str,
+                          value: Union[None, Parameter.Type, ParameterValue] = None,
+                          descriptor: Optional[ParameterDescriptor] = None,
+                          ignore_override: bool = False) -> Parameter[Any]: ...
+
+    def declare_parameter(  # type: ignore[misc]
         self,
         name: str,
-        value: Any = None,
+        value: Union[AllowableParameterValue, Parameter.Type, ParameterValue] = None,
         descriptor: Optional[ParameterDescriptor] = None,
         ignore_override: bool = False
-    ) -> Parameter:
+    ) -> Parameter[Any]:
         """
         Declare and initialize a parameter.
 
         This method, if successful, will result in any callback registered with
-        :func:`add_on_set_parameters_callback` to be called.
+        :func:`add_on_set_parameters_callback` and :func:`add_post_set_parameters_callback`
+        to be called.
+
+        The name and type in the given descriptor is ignored, and should be specified using
+        the name argument to this function and the default value's type instead.
 
         :param name: Fully-qualified name of the parameter, including its namespace.
         :param value: Value of the parameter to declare.
@@ -360,7 +360,7 @@ class Node:
         """
         if value is None and descriptor is None:
             # Temporal patch so we get deprecation warning if only a name is provided.
-            args = (name, )
+            args: Union[Tuple[str], Tuple[str, ParameterInput, ParameterDescriptor]] = (name, )
         else:
             descriptor = ParameterDescriptor() if descriptor is None else descriptor
             args = (name, value, descriptor)
@@ -369,18 +369,19 @@ class Node:
     def declare_parameters(
         self,
         namespace: str,
-        parameters: List[Union[
+        parameters: Sequence[Union[
             Tuple[str],
-            Tuple[str, Parameter.Type],
-            Tuple[str, Any, ParameterDescriptor],
-        ]],
+            Tuple[str, ParameterInput],
+            Tuple[str, ParameterInput, ParameterDescriptor]]],
         ignore_override: bool = False
-    ) -> List[Parameter]:
+    ) -> List[Parameter[Any]]:
         """
         Declare a list of parameters.
 
         The tuples in the given parameter list shall contain the name for each parameter,
         optionally providing a value and a descriptor.
+        The name and type in the given descriptors are ignored, and should be specified using
+        the name argument to this function and the default value's type instead.
         For each entry in the list, a parameter with a name of "namespace.name"
         will be declared.
         The resulting value for each declared parameter will be returned, considering
@@ -394,11 +395,22 @@ class Node:
         expanding "namespace.name".
         This allows you to declare several parameters at once without a namespace.
 
-        This method, if successful, will result in any callback registered with
-        :func:`add_on_set_parameters_callback` to be called once for each parameter.
-        If one of those calls fail, an exception will be raised and the remaining parameters will
-        not be declared.
-        Parameters declared up to that point will not be undeclared.
+        This method will result in any callback registered with
+        :func:`add_on_set_parameters_callback` and :func:`add_post_set_parameters_callback`
+        to be called once for each parameter.
+
+        If a callback was registered previously with :func:`add_on_set_parameters_callback`, it
+        will be called prior to setting the parameters for the node, once for each parameter.
+        If one of the calls due to :func:`add_on_set_parameters_callback` fail, an exception will
+        be raised and the remaining parameters will not be declared. Parameters declared up to that
+        point will not be undeclared.
+
+        If a callback was registered previously with :func:`add_post_set_parameters_callback`,
+        it will be called after setting the parameters successfully for the node,
+        once for each parameter.
+
+        This method will `not` result in any callbacks registered with
+        :func:`add_pre_set_parameters_callback` to be called.
 
         :param namespace: Namespace for parameters.
         :param parameters: List of tuples with parameters to declare.
@@ -409,8 +421,8 @@ class Node:
         :raises: InvalidParameterValueException if the registered callback rejects any parameter.
         :raises: TypeError if any tuple in **parameters** does not match the annotated type.
         """
-        parameter_list = []
-        descriptors = {}
+        parameter_list: List[Parameter[Any]] = []
+        descriptors: Dict[str, ParameterDescriptor] = {}
         for index, parameter_tuple in enumerate(parameters):
             if len(parameter_tuple) < 1 or len(parameter_tuple) > 3:
                 raise TypeError(
@@ -423,13 +435,18 @@ class Node:
             # Get the values from the tuple, checking its types.
             # Use defaults if the tuple doesn't contain value and / or descriptor.
             name = parameter_tuple[0]
-            second_arg = parameter_tuple[1] if 1 < len(parameter_tuple) else None
-            descriptor = parameter_tuple[2] if 2 < len(parameter_tuple) else ParameterDescriptor()
-
             if not isinstance(name, str):
                 raise TypeError(
                         f'First element {name} at index {index} in parameters list '
                         'is not a str.')
+            if namespace:
+                name = f'{namespace}.{name}'
+
+            # Note(jubeira): declare_parameters verifies the name, but set_parameters doesn't.
+            validate_parameter_name(name)
+
+            second_arg = parameter_tuple[1] if len(parameter_tuple) > 1 else None
+            descriptor = parameter_tuple[2] if len(parameter_tuple) > 2 else ParameterDescriptor()
             if not isinstance(descriptor, ParameterDescriptor):
                 raise TypeError(
                     f'Third element {descriptor} at index {index} in parameters list '
@@ -437,15 +454,14 @@ class Node:
                 )
 
             if len(parameter_tuple) == 1:
-                warnings.warn(
+                raise TypeError(
                     f"when declaring parameter named '{name}', "
-                    'declaring a parameter only providing its name is deprecated. '
+                    'declaring a parameter only providing its name is not allowed. '
                     'You have to either:\n'
                     '\t- Pass a name and a default value different to "PARAMETER NOT SET"'
                     ' (and optionally a descriptor).\n'
                     '\t- Pass a name and a parameter type.\n'
                     '\t- Pass a name and a descriptor with `dynamic_typing=True')
-                descriptor.dynamic_typing = True
 
             if isinstance(second_arg, Parameter.Type):
                 if second_arg == Parameter.Type.NOT_SET:
@@ -458,26 +474,25 @@ class Node:
                 descriptor.type = second_arg.value
             else:
                 value = second_arg
-                if not descriptor.dynamic_typing and value is not None:
+                if not descriptor.dynamic_typing:
                     # infer type from default value
-                    if not isinstance(value, ParameterValue):
-                        descriptor.type = Parameter.Type.from_parameter_value(value).value
-                    else:
-                        if value.type == ParameterType.PARAMETER_NOT_SET:
-                            raise ValueError(
-                                'Cannot declare a statically typed parameter with default value '
-                                'of type PARAMETER_NOT_SET')
+                    if isinstance(value, ParameterValue):
                         descriptor.type = value.type
+                    else:
+                        descriptor.type = Parameter.Type.from_parameter_value(value).value
+                    if descriptor.type == ParameterType.PARAMETER_NOT_SET:
+                        raise ValueError(
+                            'Cannot declare a statically typed parameter with default value '
+                            'of type PARAMETER_NOT_SET')
 
             # Get value from parameter overrides, of from tuple if it doesn't exist.
             if not ignore_override and name in self._parameter_overrides:
                 value = self._parameter_overrides[name].value
 
-            if namespace:
-                name = f'{namespace}.{name}'
-
-            # Note(jubeira): declare_parameters verifies the name, but set_parameters doesn't.
-            validate_parameter_name(name)
+            if isinstance(value, ParameterValue):
+                raise ValueError('Cannot declare a Parameter from a ParameterValue without it '
+                                 'being included in self._parameter_overrides, and ',
+                                 'ignore_override=False')
 
             parameter_list.append(Parameter(name, value=value))
             descriptors.update({name: descriptor})
@@ -490,21 +505,76 @@ class Node:
 
         # Call the callback once for each of the parameters, using method that doesn't
         # check whether the parameter was declared beforehand or not.
-        self._set_parameters(
+        self._declare_parameter_common(
             parameter_list,
-            descriptors,
-            raise_on_failure=True,
-            allow_undeclared_parameters=True
+            descriptors
         )
         # Don't call get_parameters() to bypass check for NOT_SET parameters
         return [self._parameters[parameter.name] for parameter in parameter_list]
 
-    def undeclare_parameter(self, name: str):
+    def _declare_parameter_common(
+        self,
+        parameter_list: List[Parameter[Any]],
+        descriptors: Optional[Dict[str, ParameterDescriptor]] = None
+    ) -> List[SetParametersResult]:
+        """
+        Declare parameters for the node, and return the result for the declare action.
+
+        Method for internal usage; applies a setter method for each parameters in the list.
+        By default, it checks if the parameters were declared, raising an exception if at least
+        one of them was not.
+
+        This method will result in any callback registered with
+        :func:`add_on_set_parameters_callback` and :func:`add_post_set_parameters_callback`
+        to be called once for each parameter.
+
+        If a callback was registered previously with :func:`add_on_set_parameters_callback`, it
+        will be called prior to setting the parameters for the node, once for each parameter.
+        If the callback doesn't succeed for a given parameter an exception will be raised.
+
+        If a callback was registered previously with :func:`add_post_set_parameters_callback`,
+        it will be called after setting the parameters successfully for the node,
+        once for each parameter.
+
+        This method will `not` result in any callbacks registered with
+        :func:`add_pre_set_parameters_callback` to be called.
+
+        :param parameter_list: List of parameters to set.
+        :param descriptors: Descriptors to set to the given parameters.
+           If descriptors are given, each parameter in the list must have a corresponding one.
+        :return: The result for each set action as a list.
+        :raises: InvalidParameterValueException if the user-defined callback rejects the
+            parameter value.
+        :raises: ParameterNotDeclaredException if undeclared parameters are not allowed in this
+            method and at least one parameter in the list hadn't been declared beforehand.`
+        """
+        if descriptors is not None:
+            assert all(parameter.name in descriptors for parameter in parameter_list)
+
+        results = []
+        for param in parameter_list:
+            # If undeclared parameters are allowed, parameters with type NOT_SET shall be stored.
+            result = self._set_parameters_atomically_common(
+                [param],
+                descriptors,
+                allow_not_set_type=True
+            )
+            if not result.successful:
+                if result.reason.startswith('Wrong parameter type'):
+                    if descriptors:
+                        raise InvalidParameterTypeException(
+                            param, Parameter.Type(descriptors[param._name].type).name)
+                raise InvalidParameterValueException(param.name, param.value, result.reason)
+            results.append(result)
+        return results
+
+    def undeclare_parameter(self, name: str) -> None:
         """
         Undeclare a previously declared parameter.
 
-        This method will not cause a callback registered with
-        :func:`add_on_set_parameters_callback` to be called.
+        This method will not cause a callback registered with any of the
+        :func:`add_pre_set_parameters_callback`,
+        and :func:`add_post_set_parameters_callback` to be called.
 
         :param name: Fully-qualified name of the parameter, including its namespace.
         :raises: ParameterNotDeclaredException if parameter had not been declared before.
@@ -550,13 +620,13 @@ class Node:
             and the parameter hadn't been declared beforehand.
         """
         if self.has_parameter(name):
-            return self._parameters[name].type_.value
+            return self._parameters[name].type_
         elif self._allow_undeclared_parameters:
             return Parameter.Type.NOT_SET
         else:
             raise ParameterNotDeclaredException(name)
 
-    def get_parameters(self, names: List[str]) -> List[Parameter]:
+    def get_parameters(self, names: List[str]) -> List[Parameter[Any]]:
         """
         Get a list of parameters.
 
@@ -573,7 +643,7 @@ class Node:
             raise TypeError('All names must be instances of type str')
         return [self.get_parameter(name) for name in names]
 
-    def get_parameter(self, name: str) -> Parameter:
+    def get_parameter(self, name: str) -> Parameter[Any]:
         """
         Get a parameter by name.
 
@@ -601,7 +671,7 @@ class Node:
             raise ParameterNotDeclaredException(name)
 
     def get_parameter_or(
-            self, name: str, alternative_value: Optional[Parameter] = None) -> Parameter:
+            self, name: str, alternative_value: Optional[Parameter[Any]] = None) -> Parameter[Any]:
         """
         Get a parameter or the alternative value.
 
@@ -625,10 +695,7 @@ class Node:
 
         return self._parameters[name]
 
-    def get_parameters_by_prefix(self, prefix: str) -> Dict[str, Optional[Union[
-        bool, int, float, str, bytes,
-        Sequence[bool], Sequence[int], Sequence[float], Sequence[str]
-    ]]]:
+    def get_parameters_by_prefix(self, prefix: str) -> Dict[str, Parameter[Any]]:
         """
         Get parameters that have a given prefix in their names as a dictionary.
 
@@ -654,7 +721,7 @@ class Node:
             if param_name.startswith(prefix)
         }
 
-    def set_parameters(self, parameter_list: List[Parameter]) -> List[SetParametersResult]:
+    def set_parameters(self, parameter_list: List[Parameter[Any]]) -> List[SetParametersResult]:
         """
         Set parameters for the node, and return the result for the set action.
 
@@ -670,10 +737,24 @@ class Node:
         declared before being set even if they were not declared beforehand.
         Parameter overrides are ignored by this method.
 
+        This method will result in any callback registered with
+        :func:`add_pre_set_parameters_callback`, :func:`add_on_set_parameters_callback` and
+        :func:`add_post_set_parameters_callback` to be called once for each parameter.
+
+        If a callback was registered previously with :func:`add_pre_set_parameters_callback`, it
+        will be called prior to the validation of parameters for the node, once for each parameter.
+        If this callback makes modified parameter list empty, then it will be reflected in the
+        returned result; no exceptions will be raised in this case.
+
         If a callback was registered previously with :func:`add_on_set_parameters_callback`, it
         will be called prior to setting the parameters for the node, once for each parameter.
-        If the callback prevents a parameter from being set, then it will be reflected in the
+        If this callback prevents a parameter from being set, then it will be reflected in the
         returned result; no exceptions will be raised in this case.
+
+        If a callback was registered previously with :func:`add_post_set_parameters_callback`,
+        it will be called after setting the parameters successfully for the node,
+        once for each parameter.
+
         For each successfully set parameter, a :class:`ParameterEvent` message is
         published.
 
@@ -685,63 +766,15 @@ class Node:
         :raises: ParameterNotDeclaredException if undeclared parameters are not allowed,
             and at least one parameter in the list hadn't been declared beforehand.
         """
-        return self._set_parameters(parameter_list)
-
-    def _set_parameters(
-        self,
-        parameter_list: List[Parameter],
-        descriptors: Optional[Dict[str, ParameterDescriptor]] = None,
-        raise_on_failure: bool = False,
-        allow_undeclared_parameters: bool = False
-    ) -> List[SetParametersResult]:
-        """
-        Set parameters for the node, and return the result for the set action.
-
-        Method for internal usage; applies a setter method for each parameters in the list.
-        By default it checks if the parameters were declared, raising an exception if at least
-        one of them was not.
-
-        If a callback was registered previously with :func:`add_on_set_parameters_callback`, it
-        will be called prior to setting the parameters for the node, once for each parameter.
-        If the callback doesn't succeed for a given parameter, it won't be set and either an
-        unsuccessful result will be returned for that parameter, or an exception will be raised
-        according to `raise_on_failure` flag.
-
-        :param parameter_list: List of parameters to set.
-        :param descriptors: Descriptors to set to the given parameters.
-            If descriptors are given, each parameter in the list must have a corresponding one.
-        :param raise_on_failure: True if InvalidParameterValueException has to be raised when
-            the user callback rejects a parameter, False otherwise.
-        :param allow_undeclared_parameters: If False, this method will check for undeclared
-            parameters for each of the elements in the parameter list.
-        :return: The result for each set action as a list.
-        :raises: InvalidParameterValueException if the user-defined callback rejects the
-            parameter value and raise_on_failure flag is True.
-        :raises: ParameterNotDeclaredException if undeclared parameters are not allowed in this
-            method and at least one parameter in the list hadn't been declared beforehand.
-        """
-        if descriptors is not None:
-            assert all(parameter.name in descriptors for parameter in parameter_list)
-
         results = []
         for param in parameter_list:
-            if not allow_undeclared_parameters:
-                self._check_undeclared_parameters([param])
-            # If undeclared parameters are allowed, parameters with type NOT_SET shall be stored.
-            result = self._set_parameters_atomically(
-                [param],
-                descriptors,
-                allow_not_set_type=allow_undeclared_parameters
-            )
-            if raise_on_failure and not result.successful:
-                if result.reason.startswith('Wrong parameter type'):
-                    raise InvalidParameterTypeException(
-                        param, Parameter.Type(descriptors[param._name].type).name)
-                raise InvalidParameterValueException(param.name, param.value, result.reason)
+            result = self._set_parameters_atomically([param])
             results.append(result)
+
         return results
 
-    def set_parameters_atomically(self, parameter_list: List[Parameter]) -> SetParametersResult:
+    def set_parameters_atomically(self, parameter_list: List[Parameter[Any]]
+                                  ) -> SetParametersResult:
         """
         Set the given parameters, all at one time, and then aggregate result.
 
@@ -749,16 +782,29 @@ class Node:
         allowed for the node, this method will raise a ParameterNotDeclaredException exception.
 
         Parameters are set all at once.
-        If setting a parameter fails due to not being declared, then no parameter will be set set.
+        If setting a parameter fails due to not being declared, then no parameter will be set.
         Either all of the parameters are set or none of them are set.
 
         If undeclared parameters are allowed for the node, then all the parameters will be
         implicitly declared before being set even if they were not declared beforehand.
 
+        This method will result in any callback registered with
+        :func:`add_pre_set_parameters_callback` :func:`add_on_set_parameters_callback` and
+        :func:`add_post_set_parameters_callback` to be called only once for all parameters.
+
+        If a callback was registered previously with :func:`add_pre_set_parameters_callback`, it
+        will be called prior to the validation of node parameters only once for all parameters.
+        If this callback makes modified parameter list empty, then it will be reflected in the
+        returned result; no exceptions will be raised in this case.
+
         If a callback was registered previously with :func:`add_on_set_parameters_callback`, it
         will be called prior to setting the parameters for the node only once for all parameters.
         If the callback prevents the parameters from being set, then it will be reflected in the
         returned result; no exceptions will be raised in this case.
+
+        If a callback was registered previously with :func:`add_post_set_parameters_callback`, it
+        will be called after setting the node parameters successfully only once for all parameters.
+
         For each successfully set parameter, a :class:`ParameterEvent` message is published.
 
         If the value type of the parameter is NOT_SET, and the existing parameter type is
@@ -769,28 +815,31 @@ class Node:
         :raises: ParameterNotDeclaredException if undeclared parameters are not allowed,
             and at least one parameter in the list hadn't been declared beforehand.
         """
-        self._check_undeclared_parameters(parameter_list)
         return self._set_parameters_atomically(parameter_list)
-
-    def _check_undeclared_parameters(self, parameter_list: List[Parameter]):
-        """
-        Check if parameter list has correct types and was declared beforehand.
-
-        :raises: ParameterNotDeclaredException if at least one parameter in the list was not
-            declared beforehand.
-        """
-        if not all(isinstance(parameter, Parameter) for parameter in parameter_list):
-            raise TypeError("parameter must be instance of type '{}'".format(repr(Parameter)))
-
-        undeclared_parameters = (
-            param.name for param in parameter_list if param.name not in self._parameters
-        )
-        if (not self._allow_undeclared_parameters and any(undeclared_parameters)):
-            raise ParameterNotDeclaredException(list(undeclared_parameters))
 
     def _set_parameters_atomically(
         self,
-        parameter_list: List[Parameter],
+        parameter_list: List[Parameter[Any]],
+    ) -> SetParametersResult:
+
+        modified_parameter_list = self._call_pre_set_parameters_callback(parameter_list)
+        if modified_parameter_list is not None:
+            parameter_list = modified_parameter_list
+
+            if len(parameter_list) == 0:
+                result = SetParametersResult()
+                result.successful = False
+                result.reason = 'parameter list cannot be empty, this might be due to ' \
+                                'pre_set_parameters_callback modifying the original parameters ' \
+                                'list.'
+                return result
+
+        self._check_undeclared_parameters(parameter_list)
+        return self._set_parameters_atomically_common(parameter_list)
+
+    def _set_parameters_atomically_common(
+        self,
+        parameter_list: List[Parameter[Any]],
         descriptors: Optional[Dict[str, ParameterDescriptor]] = None,
         allow_not_set_type: bool = False
     ) -> SetParametersResult:
@@ -800,10 +849,19 @@ class Node:
         This internal method does not reject undeclared parameters.
         If :param:`allow_not_set_type` is False, a parameter with type NOT_SET will be undeclared.
 
+        This method will result in any callback registered with
+        :func:`add_on_set_parameters_callback` and :func:`add_post_set_parameters_callback`
+        to be called only once for all parameters.
+
         If a callback was registered previously with :func:`add_on_set_parameters_callback`, it
         will be called prior to setting the parameters for the node only once for all parameters.
         If the callback prevents the parameters from being set, then it will be reflected in the
         returned result; no exceptions will be raised in this case.
+
+        If a callback was registered previously with :func:`add_post_set_parameters_callback`,
+        it will be called after setting the node parameters successfully only once for all
+        parameters.
+
         For each successfully set parameter, a :class:`ParameterEvent` message is
         published.
 
@@ -825,8 +883,8 @@ class Node:
 
         if not result.successful:
             return result
-        elif self._parameters_callbacks:
-            for callback in self._parameters_callbacks:
+        elif self._on_set_parameters_callbacks:
+            for callback in self._on_set_parameters_callbacks:
                 result = callback(parameter_list)
                 if not isinstance(result, SetParametersResult):
                     warnings.warn(
@@ -876,32 +934,202 @@ class Node:
                     # Descriptors have already been applied by this point.
                     self._parameters[param.name] = param
 
-            parameter_event.stamp = self._clock.now().to_msg()
-            self._parameter_event_publisher.publish(parameter_event)
+            parameter_event.stamp = self.get_clock().now().to_msg()
+            if self._parameter_event_publisher:
+                self._parameter_event_publisher.publish(parameter_event)
+
+            # call post set parameter registered callbacks
+            self._call_post_set_parameters_callback(parameter_list)
 
         return result
 
-    def add_on_set_parameters_callback(
+    def list_parameters(
         self,
-        callback: Callable[[List[Parameter]], SetParametersResult]
+        prefixes: List[str],
+        depth: int
+    ) -> ListParametersResult:
+        """
+        Get a list of parameter names and their prefixes.
+
+        :param prefixes: A list of prefixes to filter the parameter names.
+            Only the parameter names that start with any of the prefixes are returned.
+            If empty, all parameter names are returned.
+        :param depth: The depth of nested parameter names to include.
+        :return: The list of parameter names and their prefixes.
+        :raises: TypeError if the type of any of the passed arguments is not an expected type.
+        :raises: ValueError if depth is a negative integer.
+        """
+        if not isinstance(prefixes, list):
+            raise TypeError('The prefixes argument must be a list')
+        if not all(isinstance(prefix, str) for prefix in prefixes):
+            raise TypeError('All prefixes must be instances of type str')
+        if not isinstance(depth, int):
+            raise TypeError('The depth must be instance of type int')
+        if depth < 0:
+            raise ValueError('The depth must be greater than or equal to zero')
+
+        result = ListParametersResult()
+
+        separator_less_than_depth: Callable[[str], bool] = \
+            lambda s: s.count(PARAMETER_SEPARATOR_STRING) < depth
+
+        recursive: bool = \
+            (len(prefixes) == 0) and (depth == ListParameters.Request.DEPTH_RECURSIVE)
+
+        for param_name in self._parameters.keys():
+            if not recursive:
+                get_all: bool = (len(prefixes) == 0) and (separator_less_than_depth(param_name))
+                if not get_all:
+                    prefix_matches = any(
+                        param_name == prefix or
+                        (
+                            param_name.startswith(prefix+PARAMETER_SEPARATOR_STRING) and
+                            (
+                                depth == ListParameters.Request.DEPTH_RECURSIVE or
+                                separator_less_than_depth(param_name[len(prefix)+1:])
+                            )
+                        )
+                        for prefix in prefixes
+                    )
+                    if not prefix_matches:
+                        continue
+
+            result.names.append(param_name)
+            last_separator = param_name.rfind(PARAMETER_SEPARATOR_STRING)
+            if last_separator != -1:
+                prefix = param_name[:last_separator]
+                if prefix not in result.prefixes:
+                    result.prefixes.append(prefix)
+
+        return result
+
+    def _check_undeclared_parameters(self, parameter_list: List[Parameter[Any]]) -> None:
+        """
+        Check if parameter list has correct types and was declared beforehand.
+
+        :raises: ParameterNotDeclaredException if at least one parameter in the list was not
+            declared beforehand.
+        """
+        if not all(isinstance(parameter, Parameter) for parameter in parameter_list):
+            raise TypeError("parameter must be instance of type '{}'".format(repr(Parameter)))
+
+        undeclared_parameters = (
+            param.name for param in parameter_list if param.name not in self._parameters
+        )
+        if not self._allow_undeclared_parameters and any(undeclared_parameters):
+            raise ParameterNotDeclaredException(list(undeclared_parameters))
+
+    def _call_pre_set_parameters_callback(self, parameter_list: List[Parameter[Any]]
+                                          ) -> Optional[List[Parameter[Any]]]:
+        if self._pre_set_parameters_callbacks:
+            modified_parameter_list: List[Parameter[Any]] = []
+            for callback in self._pre_set_parameters_callbacks:
+                modified_parameter_list.extend(callback(parameter_list))
+
+            return modified_parameter_list
+        else:
+            return None
+
+    def _call_post_set_parameters_callback(self, parameter_list: List[Parameter[Any]]) -> None:
+        if self._post_set_parameters_callbacks:
+            for callback in self._post_set_parameters_callbacks:
+                callback(parameter_list)
+
+    def add_pre_set_parameters_callback(
+            self,
+            callback: Callable[[List[Parameter[Any]]], List[Parameter[Any]]]
+    ) -> None:
+        """
+        Add a callback gets triggered before parameters are validated.
+
+        Calling this function will add a callback in self._pre_set_parameter_callbacks list.
+
+        This callback can be used to modify the original list of parameters being
+        set by the user. The modified list of parameters is then forwarded to the
+        "on set parameter" callback for validation.
+
+        The callback takes a list of parameters to be set and returns a list of
+        modified parameters.
+
+        One of the use case of "pre set callback" can be updating additional parameters
+        conditioned on changes to a parameter.
+
+        All parameters in the modified list will be set atomically.
+
+        Note that the callback is only called while setting parameters with ``set_parameters``,
+        ``set_parameters_atomically``, or externally with a parameters service.
+
+        The callback is not called when parameters are declared with ``declare_parameter``
+        or ``declare_parameters``.
+
+        The callback is not called when parameters are undeclared with ``undeclare_parameter``.
+
+        An empty modified parameter list from the callback will result in ``set_parameter*``
+        returning an unsuccessful result.
+
+        :param callback: The function that is called before parameters are validated.
+        """
+        self._pre_set_parameters_callbacks.insert(0, callback)
+
+    def add_on_set_parameters_callback(
+            self,
+            callback: Callable[[List[Parameter[Any]]], SetParametersResult]
     ) -> None:
         """
         Add a callback in front to the list of callbacks.
 
-        Calling this function will add a callback in self._parameter_callbacks list.
+        Calling this function will add a callback in self._on_set_parameter_callbacks list.
 
         It is considered bad practice to reject changes for "unknown" parameters as this prevents
         other parts of the node (that may be aware of these parameters) from handling them.
 
-        :param callback: The function that is called whenever parameters are set for the node.
+        :param callback: The function that is called whenever parameters are being validated
+                         for the node.
         """
         if not callable(callback):
             raise TypeError('Callback must be callable, got {}', type(callback))
-        self._parameters_callbacks.insert(0, callback)
+        self._on_set_parameters_callbacks.insert(0, callback)
+
+    def add_post_set_parameters_callback(
+            self,
+            callback: Callable[[List[Parameter[Any]]], None]
+    ) -> None:
+        """
+        Add a callback gets triggered after parameters are set successfully.
+
+        Calling this function will add a callback in self._post_set_parameter_callbacks list.
+
+        The callback signature is designed to allow handling of the ``set_parameter*``
+        or ``declare_parameter*`` methods. The callback takes a list of parameters that
+        have been set successfully.
+
+        The callback can be valuable as a place to cause side effects based on parameter
+        changes. For instance updating the internally tracked class attributes once the params
+        have been changed successfully.
+
+        :param callback: The function that is called after parameters are set for the node.
+        """
+        if not callable(callback):
+            raise TypeError('Callback must be callable, got {}', type(callback))
+        self._post_set_parameters_callbacks.insert(0, callback)
+
+    def remove_pre_set_parameters_callback(
+            self,
+            callback: Callable[[List[Parameter[Any]]], List[Parameter[Any]]]
+    ) -> None:
+        """
+        Remove a callback from list of callbacks.
+
+        Calling this function will remove the callback from self._pre_set_parameter_callbacks list.
+
+        :param callback: The function that is called whenever parameters are set for the node.
+        :raises: ValueError if a callback is not present in the list of callbacks.
+        """
+        self._pre_set_parameters_callbacks.remove(callback)
 
     def remove_on_set_parameters_callback(
-        self,
-        callback: Callable[[List[Parameter]], SetParametersResult]
+            self,
+            callback: Callable[[List[Parameter[Any]]], SetParametersResult]
     ) -> None:
         """
         Remove a callback from list of callbacks.
@@ -911,11 +1139,25 @@ class Node:
         :param callback: The function that is called whenever parameters are set for the node.
         :raises: ValueError if a callback is not present in the list of callbacks.
         """
-        self._parameters_callbacks.remove(callback)
+        self._on_set_parameters_callbacks.remove(callback)
+
+    def remove_post_set_parameters_callback(
+            self,
+            callback: Callable[[List[Parameter[Any]]], None]
+    ) -> None:
+        """
+        Remove a callback from list of callbacks.
+
+        Calling this function will remove the callback from self._parameter_callbacks list.
+
+        :param callback: The function that is called whenever parameters are set for the node.
+        :raises: ValueError if a callback is not present in the list of callbacks.
+        """
+        self._post_set_parameters_callbacks.remove(callback)
 
     def _apply_descriptors(
         self,
-        parameter_list: List[Parameter],
+        parameter_list: List[Parameter[Any]],
         descriptors: Dict[str, ParameterDescriptor],
         check_read_only: bool = True
     ) -> SetParametersResult:
@@ -927,7 +1169,7 @@ class Node:
 
         :param parameter_list: Parameters to be checked.
         :param descriptors: Descriptors to apply.
-        :param check_read_only: True if read-only check has to be applied.
+        :param check_read_only: ``True`` if read-only check has to be applied.
         :return: SetParametersResult; successful if checks passed, unsuccessful otherwise.
         :raises: ParameterNotDeclaredException if a descriptor is not provided, the given parameter
             name had not been declared and undeclared parameters are not allowed.
@@ -941,7 +1183,7 @@ class Node:
 
     def _apply_descriptor(
         self,
-        parameter: Parameter,
+        parameter: Parameter[Any],
         descriptor: Optional[ParameterDescriptor] = None,
         check_read_only: bool = True
     ) -> SetParametersResult:
@@ -952,9 +1194,9 @@ class Node:
         If a descriptor is provided, its name will be set to the name of the parameter.
 
         :param parameter: Parameter to be checked.
-        :param descriptor: Descriptor to apply. If None, the stored descriptor for the given
+        :param descriptor: Descriptor to apply. If ``None``, the stored descriptor for the given
             parameter's name is used instead.
-        :param check_read_only: True if read-only check has to be applied.
+        :param check_read_only: ``True`` if read-only check has to be applied.
         :return: SetParametersResult; successful if checks passed, unsuccessful otherwise.
         :raises: ParameterNotDeclaredException if a descriptor is not provided, the given parameter
             name had not been declared and undeclared parameters are not allowed.
@@ -999,7 +1241,7 @@ class Node:
 
     def _apply_integer_range(
         self,
-        parameter: Parameter,
+        parameter: Parameter[int],
         integer_range: IntegerRange
     ) -> SetParametersResult:
         min_value = min(integer_range.from_value, integer_range.to_value)
@@ -1035,7 +1277,7 @@ class Node:
 
     def _apply_floating_point_range(
         self,
-        parameter: Parameter,
+        parameter: Parameter[float],
         floating_point_range: FloatingPointRange
     ) -> SetParametersResult:
         min_value = min(floating_point_range.from_value, floating_point_range.to_value)
@@ -1080,7 +1322,7 @@ class Node:
 
     def _apply_descriptor_and_set(
         self,
-        parameter: Parameter,
+        parameter: Parameter[Any],
         descriptor: Optional[ParameterDescriptor] = None,
         check_read_only: bool = True
     ) -> SetParametersResult:
@@ -1136,7 +1378,7 @@ class Node:
         """
         Set a new descriptor for a given parameter.
 
-        The name in the descriptor is ignored and set to **name**.
+        The name in the descriptor is ignored and set to ``name``.
 
         :param name: Fully-qualified name of the parameter to set the descriptor to.
         :param descriptor: New descriptor to apply to the parameter.
@@ -1181,7 +1423,8 @@ class Node:
         self._descriptors[name] = descriptor
         return self.get_parameter(name).get_parameter_value()
 
-    def _validate_topic_or_service_name(self, topic_or_service_name, *, is_service=False):
+    def _validate_topic_or_service_name(self, topic_or_service_name: str, *,
+                                        is_service: bool = False) -> None:
         name = self.get_name()
         namespace = self.get_namespace()
         validate_node_name(name)
@@ -1190,7 +1433,7 @@ class Node:
         expanded_topic_or_service_name = expand_topic_name(topic_or_service_name, name, namespace)
         validate_full_topic_name(expanded_topic_or_service_name, is_service=is_service)
 
-    def _validate_qos_or_depth_parameter(self, qos_or_depth) -> QoSProfile:
+    def _validate_qos_or_depth_parameter(self, qos_or_depth: Union[QoSProfile, int]) -> QoSProfile:
         if isinstance(qos_or_depth, QoSProfile):
             return qos_or_depth
         elif isinstance(qos_or_depth, int):
@@ -1201,32 +1444,14 @@ class Node:
             raise TypeError(
                 'Expected QoSProfile or int, but received {!r}'.format(type(qos_or_depth)))
 
-    def add_waitable(self, waitable: Waitable) -> None:
-        """
-        Add a class that is capable of adding things to the wait set.
-
-        :param waitable: An instance of a waitable that the node will add to the waitset.
-        """
-        self.__waitables.append(waitable)
-        self._wake_executor()
-
-    def remove_waitable(self, waitable: Waitable) -> None:
-        """
-        Remove a Waitable that was previously added to the node.
-
-        :param waitable: The Waitable to remove.
-        """
-        self.__waitables.remove(waitable)
-        self._wake_executor()
-
     def resolve_topic_name(self, topic: str, *, only_expand: bool = False) -> str:
         """
         Return a topic name expanded and remapped.
 
-        :param topic: topic name to be expanded and remapped.
-        :param only_expand: if `True`, remapping rules won't be applied.
-        :return: a fully qualified topic name,
-            result of applying expansion and remapping to the given `topic`.
+        :param topic: Topic name to be expanded and remapped.
+        :param only_expand: If ``True``, remapping rules won't be applied.
+        :return: A fully qualified topic name,
+            the result of applying expansion and remapping to the given ``topic``.
         """
         with self.handle:
             return _rclpy.rclpy_resolve_name(self.handle, topic, only_expand, False)
@@ -1237,464 +1462,13 @@ class Node:
         """
         Return a service name expanded and remapped.
 
-        :param service: service name to be expanded and remapped.
-        :param only_expand: if `True`, remapping rules won't be applied.
-        :return: a fully qualified service name,
-            result of applying expansion and remapping to the given `service`.
+        :param service: Service name to be expanded and remapped.
+        :param only_expand: If ``True``, remapping rules won't be applied.
+        :return: A fully qualified service name,
+            the result of applying expansion and remapping to the given ``service``.
         """
         with self.handle:
             return _rclpy.rclpy_resolve_name(self.handle, service, only_expand, True)
-
-    def create_publisher(
-        self,
-        msg_type,
-        topic: str,
-        qos_profile: Union[QoSProfile, int],
-        *,
-        callback_group: Optional[CallbackGroup] = None,
-        event_callbacks: Optional[PublisherEventCallbacks] = None,
-        qos_overriding_options: Optional[QoSOverridingOptions] = None,
-        publisher_class: Type[Publisher] = Publisher,
-    ) -> Publisher:
-        """
-        Create a new publisher.
-
-        :param msg_type: The type of ROS messages the publisher will publish.
-        :param topic: The name of the topic the publisher will publish to.
-        :param qos_profile: A QoSProfile or a history depth to apply to the publisher.
-          In the case that a history depth is provided, the QoS history is set to
-          KEEP_LAST, the QoS history depth is set to the value
-          of the parameter, and all other QoS settings are set to their default values.
-        :param callback_group: The callback group for the publisher's event handlers.
-            If ``None``, then the node's default callback group is used.
-        :param event_callbacks: User-defined callbacks for middleware events.
-        :return: The new publisher.
-        """
-        qos_profile = self._validate_qos_or_depth_parameter(qos_profile)
-
-        callback_group = callback_group or self.default_callback_group
-
-        failed = False
-        try:
-            final_topic = self.resolve_topic_name(topic)
-        except RuntimeError:
-            # if it's name validation error, raise a more appropriate exception.
-            try:
-                self._validate_topic_or_service_name(topic)
-            except InvalidTopicNameException as ex:
-                raise ex from None
-            # else reraise the previous exception
-            raise
-
-        if qos_overriding_options is None:
-            qos_overriding_options = QoSOverridingOptions([])
-        _declare_qos_parameters(
-            Publisher, self, final_topic, qos_profile, qos_overriding_options)
-
-        # this line imports the typesupport for the message module if not already done
-        failed = False
-        check_is_valid_msg_type(msg_type)
-        try:
-            with self.handle:
-                publisher_object = _rclpy.Publisher(
-                    self.handle, msg_type, topic, qos_profile.get_c_qos_profile())
-        except ValueError:
-            failed = True
-        if failed:
-            self._validate_topic_or_service_name(topic)
-
-        try:
-            publisher = publisher_class(
-                publisher_object, msg_type, topic, qos_profile,
-                event_callbacks=event_callbacks or PublisherEventCallbacks(),
-                callback_group=callback_group)
-        except Exception:
-            publisher_object.destroy_when_not_in_use()
-            raise
-        self._publishers.append(publisher)
-        self._wake_executor()
-
-        for event_callback in publisher.event_handlers:
-            self.add_waitable(event_callback)
-
-        return publisher
-
-    def create_subscription(
-        self,
-        msg_type,
-        topic: str,
-        callback: Callable[[MsgType], None],
-        qos_profile: Union[QoSProfile, int],
-        *,
-        callback_group: Optional[CallbackGroup] = None,
-        event_callbacks: Optional[SubscriptionEventCallbacks] = None,
-        qos_overriding_options: Optional[QoSOverridingOptions] = None,
-        raw: bool = False
-    ) -> Subscription:
-        """
-        Create a new subscription.
-
-        :param msg_type: The type of ROS messages the subscription will subscribe to.
-        :param topic: The name of the topic the subscription will subscribe to.
-        :param callback: A user-defined callback function that is called when a message is
-            received by the subscription.
-        :param qos_profile: A QoSProfile or a history depth to apply to the subscription.
-          In the case that a history depth is provided, the QoS history is set to
-          KEEP_LAST, the QoS history depth is set to the value
-          of the parameter, and all other QoS settings are set to their default values.
-        :param callback_group: The callback group for the subscription. If ``None``, then the
-            nodes default callback group is used.
-        :param event_callbacks: User-defined callbacks for middleware events.
-        :param raw: If ``True``, then received messages will be stored in raw binary
-            representation.
-        """
-        qos_profile = self._validate_qos_or_depth_parameter(qos_profile)
-
-        callback_group = callback_group or self.default_callback_group
-
-        try:
-            final_topic = self.resolve_topic_name(topic)
-        except RuntimeError:
-            # if it's name validation error, raise a more appropriate exception.
-            try:
-                self._validate_topic_or_service_name(topic)
-            except InvalidTopicNameException as ex:
-                raise ex from None
-            # else reraise the previous exception
-            raise
-
-        if qos_overriding_options is None:
-            qos_overriding_options = QoSOverridingOptions([])
-        _declare_qos_parameters(
-            Subscription, self, final_topic, qos_profile, qos_overriding_options)
-
-        # this line imports the typesupport for the message module if not already done
-        failed = False
-        check_is_valid_msg_type(msg_type)
-        try:
-            with self.handle:
-                subscription_object = _rclpy.Subscription(
-                    self.handle, msg_type, topic, qos_profile.get_c_qos_profile())
-        except ValueError:
-            failed = True
-        if failed:
-            self._validate_topic_or_service_name(topic)
-
-        try:
-            subscription = Subscription(
-                subscription_object, msg_type,
-                topic, callback, callback_group, qos_profile, raw,
-                event_callbacks=event_callbacks or SubscriptionEventCallbacks())
-        except Exception:
-            subscription_object.destroy_when_not_in_use()
-            raise
-        callback_group.add_entity(subscription)
-        self._subscriptions.append(subscription)
-        self._wake_executor()
-
-        for event_handler in subscription.event_handlers:
-            self.add_waitable(event_handler)
-
-        return subscription
-
-    def create_client(
-        self,
-        srv_type,
-        srv_name: str,
-        *,
-        qos_profile: QoSProfile = qos_profile_services_default,
-        callback_group: Optional[CallbackGroup] = None
-    ) -> Client:
-        """
-        Create a new service client.
-
-        :param srv_type: The service type.
-        :param srv_name: The name of the service.
-        :param qos_profile: The quality of service profile to apply the service client.
-        :param callback_group: The callback group for the service client. If ``None``, then the
-            nodes default callback group is used.
-        """
-        if callback_group is None:
-            callback_group = self.default_callback_group
-        check_is_valid_srv_type(srv_type)
-        failed = False
-        try:
-            with self.handle:
-                client_impl = _rclpy.Client(
-                    self.handle,
-                    srv_type,
-                    srv_name,
-                    qos_profile.get_c_qos_profile())
-        except ValueError:
-            failed = True
-        if failed:
-            self._validate_topic_or_service_name(srv_name, is_service=True)
-
-        client = Client(
-            self.context,
-            client_impl, srv_type, srv_name, qos_profile,
-            callback_group)
-        callback_group.add_entity(client)
-        self._clients.append(client)
-        self._wake_executor()
-        return client
-
-    def create_service(
-        self,
-        srv_type,
-        srv_name: str,
-        callback: Callable[[SrvTypeRequest, SrvTypeResponse], SrvTypeResponse],
-        *,
-        qos_profile: QoSProfile = qos_profile_services_default,
-        callback_group: Optional[CallbackGroup] = None
-    ) -> Service:
-        """
-        Create a new service server.
-
-        :param srv_type: The service type.
-        :param srv_name: The name of the service.
-        :param callback: A user-defined callback function that is called when a service request
-            received by the server.
-        :param qos_profile: The quality of service profile to apply the service server.
-        :param callback_group: The callback group for the service server. If ``None``, then the
-            nodes default callback group is used.
-        """
-        if callback_group is None:
-            callback_group = self.default_callback_group
-        check_is_valid_srv_type(srv_type)
-        failed = False
-        try:
-            with self.handle:
-                service_impl = _rclpy.Service(
-                    self.handle,
-                    srv_type,
-                    srv_name,
-                    qos_profile.get_c_qos_profile())
-        except ValueError:
-            failed = True
-        if failed:
-            self._validate_topic_or_service_name(srv_name, is_service=True)
-
-        service = Service(
-            service_impl,
-            srv_type, srv_name, callback, callback_group, qos_profile)
-        callback_group.add_entity(service)
-        self._services.append(service)
-        self._wake_executor()
-        return service
-
-    def create_timer(
-        self,
-        timer_period_sec: float,
-        callback: Callable,
-        callback_group: Optional[CallbackGroup] = None,
-        clock: Optional[Clock] = None,
-    ) -> Timer:
-        """
-        Create a new timer.
-
-        The timer will be started and every ``timer_period_sec`` number of seconds the provided
-        callback function will be called.
-
-        :param timer_period_sec: The period (s) of the timer.
-        :param callback: A user-defined callback function that is called when the timer expires.
-        :param callback_group: The callback group for the timer. If ``None``, then the nodes
-            default callback group is used.
-        :param clock: The clock which the timer gets time from.
-        """
-        timer_period_nsec = int(float(timer_period_sec) * S_TO_NS)
-        if callback_group is None:
-            callback_group = self.default_callback_group
-        if clock is None:
-            clock = self._clock
-        timer = Timer(callback, callback_group, timer_period_nsec, clock, context=self.context)
-
-        callback_group.add_entity(timer)
-        self._timers.append(timer)
-        self._wake_executor()
-        return timer
-
-    def create_guard_condition(
-        self,
-        callback: Callable,
-        callback_group: Optional[CallbackGroup] = None
-    ) -> GuardCondition:
-        """Create a new guard condition."""
-        if callback_group is None:
-            callback_group = self.default_callback_group
-        guard = GuardCondition(callback, callback_group, context=self.context)
-
-        callback_group.add_entity(guard)
-        self._guards.append(guard)
-        self._wake_executor()
-        return guard
-
-    def create_rate(
-        self,
-        frequency: float,
-        clock: Optional[Clock] = None,
-    ) -> Rate:
-        """
-        Create a Rate object.
-
-        :param frequency: The frequency the Rate runs at (Hz).
-        :param clock: The clock the Rate gets time from.
-        """
-        if frequency <= 0:
-            raise ValueError('frequency must be > 0')
-        # Create a timer and give it to the rate object
-        period = 1.0 / frequency
-        # Rate will set its own callback
-        callback = None
-        # Rates get their own group so timing is not messed up by other callbacks
-        group = self._rate_group
-        timer = self.create_timer(period, callback, group, clock)
-        return Rate(timer, context=self.context)
-
-    def destroy_publisher(self, publisher: Publisher) -> bool:
-        """
-        Destroy a publisher created by the node.
-
-        :return: ``True`` if successful, ``False`` otherwise.
-        """
-        if publisher in self._publishers:
-            self._publishers.remove(publisher)
-            for event_handler in publisher.event_handlers:
-                self.__waitables.remove(event_handler)
-            try:
-                publisher.destroy()
-            except InvalidHandle:
-                return False
-            self._wake_executor()
-            return True
-        return False
-
-    def destroy_subscription(self, subscription: Subscription) -> bool:
-        """
-        Destroy a subscription created by the node.
-
-        :return: ``True`` if succesful, ``False`` otherwise.
-        """
-        if subscription in self._subscriptions:
-            self._subscriptions.remove(subscription)
-            for event_handler in subscription.event_handlers:
-                self.__waitables.remove(event_handler)
-            try:
-                subscription.destroy()
-            except InvalidHandle:
-                return False
-            self._wake_executor()
-            return True
-        return False
-
-    def destroy_client(self, client: Client) -> bool:
-        """
-        Destroy a service client created by the node.
-
-        :return: ``True`` if successful, ``False`` otherwise.
-        """
-        if client in self._clients:
-            self._clients.remove(client)
-            try:
-                client.destroy()
-            except InvalidHandle:
-                return False
-            self._wake_executor()
-            return True
-        return False
-
-    def destroy_service(self, service: Service) -> bool:
-        """
-        Destroy a service server created by the node.
-
-        :return: ``True`` if successful, ``False`` otherwise.
-        """
-        if service in self._services:
-            self._services.remove(service)
-            try:
-                service.destroy()
-            except InvalidHandle:
-                return False
-            self._wake_executor()
-            return True
-        return False
-
-    def destroy_timer(self, timer: Timer) -> bool:
-        """
-        Destroy a timer created by the node.
-
-        :return: ``True`` if successful, ``False`` otherwise.
-        """
-        if timer in self._timers:
-            self._timers.remove(timer)
-            try:
-                timer.destroy()
-            except InvalidHandle:
-                return False
-            self._wake_executor()
-            return True
-        return False
-
-    def destroy_guard_condition(self, guard: GuardCondition) -> bool:
-        """
-        Destroy a guard condition created by the node.
-
-        :return: ``True`` if successful, ``False`` otherwise.
-        """
-        if guard in self._guards:
-            self._guards.remove(guard)
-            try:
-                guard.destroy()
-            except InvalidHandle:
-                return False
-            self._wake_executor()
-            return True
-        return False
-
-    def destroy_rate(self, rate: Rate) -> bool:
-        """
-        Destroy a Rate object created by the node.
-
-        :return: ``True`` if successful, ``False`` otherwise.
-        """
-        success = self.destroy_timer(rate._timer)
-        rate.destroy()
-        return success
-
-    def destroy_node(self):
-        """
-        Destroy the node.
-
-        Frees resources used by the node, including any entities created by the following methods:
-
-        * :func:`create_publisher`
-        * :func:`create_subscription`
-        * :func:`create_client`
-        * :func:`create_service`
-        * :func:`create_timer`
-        * :func:`create_guard_condition`
-
-        """
-        # Drop extra reference to parameter event publisher.
-        # It will be destroyed with other publishers below.
-        self._parameter_event_publisher = None
-
-        # Destroy dependent items eagerly to work around a possible hang
-        # https://github.com/ros2/build_cop/issues/248
-        while self._publishers:
-            self.destroy_publisher(self._publishers[0])
-        while self._subscriptions:
-            self.destroy_subscription(self._subscriptions[0])
-        while self._clients:
-            self.destroy_client(self._clients[0])
-        while self._services:
-            self.destroy_service(self._services[0])
-        while self._timers:
-            self.destroy_timer(self._timers[0])
-        while self._guards:
-            self.destroy_guard_condition(self._guards[0])
-        self.__node.destroy_when_not_in_use()
-        self._wake_executor()
 
     def get_publisher_names_and_types_by_node(
         self,
@@ -1746,7 +1520,7 @@ class Node:
         node_namespace: str
     ) -> List[Tuple[str, List[str]]]:
         """
-        Get a list of discovered service server topics for a remote node.
+        Get a list of discovered service servers for a remote node.
 
         :param node_name: Name of a remote node to get services for.
         :param node_namespace: Namespace of the remote node.
@@ -1766,12 +1540,12 @@ class Node:
         node_namespace: str
     ) -> List[Tuple[str, List[str]]]:
         """
-        Get a list of discovered service client topics for a remote node.
+        Get a list of discovered service clients for a remote node.
 
         :param node_name: Name of a remote node to get service clients for.
         :param node_namespace: Namespace of the remote node.
         :return: List of tuples.
-          The fist element of each tuple is the service client name
+          The first element of each tuple is the service client name
           and the second element is a list of service client types.
         :raise NodeNameNonExistentError: If the node wasn't found.
         :raise RuntimeError: Unexpected failure.
@@ -1780,9 +1554,60 @@ class Node:
             return _rclpy.rclpy_get_client_names_and_types_by_node(
                 self.handle, node_name, node_namespace)
 
+    def get_action_client_names_and_types_by_node(
+        self,
+        node_name: str,
+        node_namespace: str
+    ) -> List[Tuple[str, List[str]]]:
+        """
+        Get a list of action names and types for action clients associated with a remote node.
+
+        :param node_name: Name of a remote node to get action clients for.
+        :param node_namespace: Namespace of the remote node.
+        :return: List of tuples.
+          The first element of each tuple is the action name and the second element is a list of
+          action types.
+        :raise NodeNameNonExistentError: If the node wasn't found.
+        :raise RuntimeError: Unexpected failure.
+        """
+        with self.handle:
+            return _rclpy.rclpy_get_action_client_names_and_types_by_node(
+                self.handle, node_name, node_namespace)
+
+    def get_action_server_names_and_types_by_node(
+        self,
+        node_name: str,
+        node_namespace: str
+    ) -> List[Tuple[str, List[str]]]:
+        """
+        Get a list of action names and types for action servers associated with a remote node.
+
+        :param node_name: Name of a remote node to get action servers for.
+        :param node_namespace: Namespace of the remote node.
+        :return: List of tuples.
+          The first element of each tuple is the action name and the second element is a list of
+          action types.
+        :raise NodeNameNonExistentError: If the node wasn't found.
+        :raise RuntimeError: Unexpected failure.
+        """
+        with self.handle:
+            return _rclpy.rclpy_get_action_server_names_and_types_by_node(
+                self.handle, node_name, node_namespace)
+
+    def get_action_names_and_types(self) -> List[Tuple[str, List[str]]]:
+        """
+        Get a list of action names and types in the ROS graph.
+
+        :return: List of tuples.
+          The first element of each tuple is the action name and the second element is a list of
+          action types.
+        """
+        with self.handle:
+            return _rclpy.rclpy_get_action_names_and_types(self.handle)
+
     def get_topic_names_and_types(self, no_demangle: bool = False) -> List[Tuple[str, List[str]]]:
         """
-        Get a list topic names and types for the node.
+        Get a list of discovered topic names and types.
 
         :param no_demangle: If ``True``, then topic names and types returned will not be demangled.
         :return: List of tuples.
@@ -1794,7 +1619,7 @@ class Node:
 
     def get_service_names_and_types(self) -> List[Tuple[str, List[str]]]:
         """
-        Get a list of service topics for the node.
+        Get a list of discovered service names and types.
 
         :return: List of tuples.
           The first element of each tuple is the service name and the second element is a list of
@@ -1812,6 +1637,20 @@ class Node:
         with self.handle:
             names_ns = self.handle.get_node_names_and_namespaces()
         return [n[0] for n in names_ns]
+
+    def get_fully_qualified_node_names(self) -> List[str]:
+        """
+        Get a list of fully qualified names for discovered nodes.
+
+        Similar to ``get_node_names_namespaces()``, but concatenates the names and namespaces.
+
+        :return: List of fully qualified node names.
+        """
+        names_and_namespaces = self.get_node_names_and_namespaces()
+        return [
+            ns + ('' if ns.endswith('/') else '/') + name
+            for name, ns in names_and_namespaces
+        ]
 
     def get_node_names_and_namespaces(self) -> List[Tuple[str, str]]:
         """
@@ -1841,7 +1680,7 @@ class Node:
         with self.handle:
             return self.handle.get_fully_qualified_name()
 
-    def _count_publishers_or_subscribers(self, topic_name, func):
+    def _count_publishers_or_subscribers(self, topic_name: str, func: Callable[[str], int]) -> int:
         fq_topic_name = expand_topic_name(topic_name, self.get_name(), self.get_namespace())
         validate_full_topic_name(fq_topic_name)
         with self.handle:
@@ -1851,12 +1690,12 @@ class Node:
         """
         Return the number of publishers on a given topic.
 
-        `topic_name` may be a relative, private, or fully qualified topic name.
+        ``topic_name`` may be a relative, private, or fully qualified topic name.
         A relative or private topic is expanded using this node's namespace and name.
         The queried topic name is not remapped.
 
-        :param topic_name: the topic_name on which to count the number of publishers.
-        :return: the number of publishers on the topic.
+        :param topic_name: The topic name on which to count the number of publishers.
+        :return: The number of publishers on the topic.
         """
         with self.handle:
             return self._count_publishers_or_subscribers(
@@ -1866,22 +1705,98 @@ class Node:
         """
         Return the number of subscribers on a given topic.
 
-        `topic_name` may be a relative, private, or fully qualified topic name.
+        ``topic_name`` may be a relative, private, or fully qualified topic name.
         A relative or private topic is expanded using this node's namespace and name.
         The queried topic name is not remapped.
 
-        :param topic_name: the topic_name on which to count the number of subscribers.
-        :return: the number of subscribers on the topic.
+        :param topic_name: The topic name on which to count the number of subscribers.
+        :return: The number of subscribers on the topic.
         """
         with self.handle:
             return self._count_publishers_or_subscribers(
                 topic_name, self.handle.get_count_subscribers)
 
+    def _count_clients_or_servers(self, service_name: str, func: Callable[[str], int]) -> int:
+        fq_service_name = expand_topic_name(service_name, self.get_name(), self.get_namespace())
+        validate_full_topic_name(fq_service_name, is_service=True)
+        with self.handle:
+            return func(fq_service_name)
+
+    def count_clients(self, service_name: str) -> int:
+        """
+        Return the number of clients on a given service.
+
+        `service_name` may be a relative, private, or fully qualified service name.
+        A relative or private service is expanded using this node's namespace and name.
+        The queried service name is not remapped.
+
+        :param service_name: the service_name on which to count the number of clients.
+        :return: the number of clients on the service.
+        """
+        with self.handle:
+            return self._count_clients_or_servers(
+                service_name, self.handle.get_count_clients)
+
+    def count_services(self, service_name: str) -> int:
+        """
+        Return the number of servers on a given service.
+
+        `service_name` may be a relative, private, or fully qualified service name.
+        A relative or private service is expanded using this node's namespace and name.
+        The queried service name is not remapped.
+
+        :param service_name: the service_name on which to count the number of clients.
+        :return: the number of servers on the service.
+        """
+        with self.handle:
+            return self._count_clients_or_servers(
+                service_name, self.handle.get_count_services)
+
+    def _count_action_clients_or_servers(
+        self,
+        action_name: str,
+        func: Callable[[str], int]
+    ) -> int:
+        fq_action_name = expand_topic_name(action_name, self.get_name(), self.get_namespace())
+        validate_full_topic_name(fq_action_name)
+        with self.handle:
+            return func(fq_action_name)
+
+    def count_action_clients(self, action_name: str) -> int:
+        """
+        Return the number of action clients on a given action.
+
+        `action_name` may be a relative, private, or fully qualified action name.
+        A relative or private action is expanded using this node's namespace and name.
+        The queried action name is not remapped.
+
+        :param action_name: the action_name on which to count the number of action clients.
+        :return: the number of action clients on the action.
+        """
+        with self.handle:
+            return self._count_action_clients_or_servers(
+                action_name, self.handle.get_count_action_clients)
+
+    def count_action_servers(self, action_name: str) -> int:
+        """
+        Return the number of action servers on a given action.
+
+        `action_name` may be a relative, private, or fully qualified action name.
+        A relative or private action is expanded using this node's namespace and name.
+        The queried action name is not remapped.
+
+        :param action_name: the action_name on which to count the number of action servers.
+        :return: the number of action servers on the action.
+        """
+        with self.handle:
+            return self._count_action_clients_or_servers(
+                action_name, self.handle.get_count_action_servers)
+
     def _get_info_by_topic(
         self,
         topic_name: str,
         no_mangle: bool,
-        func: Callable[[object, str, bool], List[Dict]]
+        func: Callable[[_rclpy.Node, str, bool], List['_rclpy._TopicEndpointInfoDict']]
     ) -> List[TopicEndpointInfo]:
         with self.handle:
             if no_mangle:
@@ -1907,18 +1822,18 @@ class Node:
         The returned parameter is a list of TopicEndpointInfo objects, where each will contain
         the node name, node namespace, topic type, topic endpoint's GID, and its QoS profile.
 
-        When the `no_mangle` parameter is `true`, the provided `topic_name` should be a valid topic
-        name for the middleware (useful when combining ROS with native middleware (e.g. DDS) apps).
-        When the `no_mangle` parameter is `false`, the provided `topic_name` should follow
-        ROS topic name conventions.
+        When the ``no_mangle`` parameter is ``True``, the provided ``topic_name`` should be a valid
+        topic name for the middleware (useful when combining ROS with native middleware (e.g. DDS)
+        apps).  When the ``no_mangle`` parameter is ``False``, the provided ``topic_name`` should
+        follow ROS topic name conventions.
 
-        `topic_name` may be a relative, private, or fully qualified topic name.
+        ``topic_name`` may be a relative, private, or fully qualified topic name.
         A relative or private topic will be expanded using this node's namespace and name.
-        The queried `topic_name` is not remapped.
+        The queried ``topic_name`` is not remapped.
 
-        :param topic_name: the topic_name on which to find the publishers.
-        :param no_mangle: no_mangle if `true`, `topic_name` needs to be a valid middleware topic
-            name, otherwise it should be a valid ROS topic name. Defaults to `false`.
+        :param topic_name: The topic_name on which to find the publishers.
+        :param no_mangle: If ``True``, ``topic_name`` needs to be a valid middleware topic
+            name, otherwise it should be a valid ROS topic name. Defaults to ``False``.
         :return: a list of TopicEndpointInfo for all the publishers on this topic.
         """
         return self._get_info_by_topic(
@@ -1937,21 +1852,999 @@ class Node:
         The returned parameter is a list of TopicEndpointInfo objects, where each will contain
         the node name, node namespace, topic type, topic endpoint's GID, and its QoS profile.
 
-        When the `no_mangle` parameter is `true`, the provided `topic_name` should be a valid topic
-        name for the middleware (useful when combining ROS with native middleware (e.g. DDS) apps).
-        When the `no_mangle` parameter is `false`, the provided `topic_name` should follow
-        ROS topic name conventions.
+        When the ``no_mangle`` parameter is ``True``, the provided ``topic_name`` should be a valid
+        topic name for the middleware (useful when combining ROS with native middleware (e.g. DDS)
+        apps).  When the ``no_mangle`` parameter is ``False``, the provided ``topic_name`` should
+        follow ROS topic name conventions.
 
-        `topic_name` may be a relative, private, or fully qualified topic name.
+        ``topic_name`` may be a relative, private, or fully qualified topic name.
         A relative or private topic will be expanded using this node's namespace and name.
-        The queried `topic_name` is not remapped.
+        The queried ``topic_name`` is not remapped.
 
-        :param topic_name: the topic_name on which to find the subscriptions.
-        :param no_mangle: no_mangle if `true`, `topic_name` needs to be a valid middleware topic
-            name, otherwise it should be a valid ROS topic name. Defaults to `false`.
-        :return: a list of TopicEndpointInfo for all the subscriptions on this topic.
+        :param topic_name: The topic_name on which to find the subscriptions.
+        :param no_mangle: If ``True``, `topic_name` needs to be a valid middleware topic
+            name, otherwise it should be a valid ROS topic name. Defaults to ``False``.
+        :return: A list of TopicEndpointInfo for all the subscriptions on this topic.
         """
         return self._get_info_by_topic(
             topic_name,
             no_mangle,
             _rclpy.rclpy_get_subscriptions_info_by_topic)
+
+    def _get_info_by_service(
+        self,
+        service_name: str,
+        no_mangle: bool,
+        func: Callable[[_rclpy.Node, str, bool], list[_rclpy._ServiceEndpointInfoDict]]
+    ) -> List[ServiceEndpointInfo]:
+        with self.handle:
+            if no_mangle:
+                fq_topic_name = service_name
+            else:
+                fq_topic_name = expand_topic_name(
+                    service_name, self.get_name(), self.get_namespace())
+                validate_full_topic_name(fq_topic_name)
+                fq_topic_name = _rclpy.rclpy_remap_topic_name(self.handle, fq_topic_name)
+            info_dicts = func(self.handle, fq_topic_name, no_mangle)
+            infos = [ServiceEndpointInfo(**x) for x in info_dicts]
+            return infos
+
+    def get_clients_info_by_service(
+        self,
+        service_name: str,
+        no_mangle: bool = False
+    ) -> List[ServiceEndpointInfo]:
+        """
+        Return a list of clients on a given service.
+
+        The returned parameter is a list of ServiceEndpointInfo objects, where each will contain
+        the node name, node namespace, service type, service endpoint's GIDs, and its QoS profiles.
+
+        When the ``no_mangle`` parameter is ``True``, the provided ``service_name`` should be a
+        valid service name for the middleware (useful when combining ROS with native middleware
+        apps). When the ``no_mangle`` parameter is ``False``,the provided
+        ``service_name`` should follow ROS service name conventions.
+        In DDS-based RMWs, services are implemented as topics with mangled
+        names (e.g., `rq/my_serviceRequest` and `rp/my_serviceReply`), so `no_mangle = true` is not
+        supported and will result in an error. Use `get_subscriptions_info_by_topic` or
+        get_publishers_info_by_topic` for unmangled topic queries in such cases. Other RMWs
+        (e.g., Zenoh) may support `no_mangle = true` if they natively handle
+        services without topic-based
+
+        ``service_name`` may be a relative, private, or fully qualified service name.
+        A relative or private service will be expanded using this node's namespace and name.
+        The queried ``service_name`` is not remapped.
+
+        :param service_name: The service_name on which to find the clients.
+        :param no_mangle: If ``True``, `service_name` needs to be a valid middleware service
+            name, otherwise it should be a valid ROS service name. Defaults to ``False``.
+        :return: A list of ServiceEndpointInfo for all the clients on this service.
+        """
+        return self._get_info_by_service(
+            service_name,
+            no_mangle,
+            _rclpy.rclpy_get_clients_info_by_service)
+
+    def get_servers_info_by_service(
+        self,
+        service_name: str,
+        no_mangle: bool = False
+    ) -> List[ServiceEndpointInfo]:
+        """
+        Return a list of servers on a given service.
+
+        The returned parameter is a list of ServiceEndpointInfo objects, where each will contain
+        the node name, node namespace, service type, service endpoint's GIDs, and its QoS profiles.
+
+        When the ``no_mangle`` parameter is ``True``, the provided ``service_name`` should be a
+        valid service name for the middleware (useful when combining ROS with native middleware
+        apps). When the ``no_mangle`` parameter is ``False``,the provided
+        ``service_name`` should follow ROS service name conventions.
+        In DDS-based RMWs, services are implemented as topics with mangled
+        names (e.g., `rq/my_serviceRequest` and `rp/my_serviceReply`), so `no_mangle = true` is not
+        supported and will result in an error. Use `get_subscriptions_info_by_topic` or
+        get_publishers_info_by_topic` for unmangled topic queries in such cases. Other RMWs
+        (e.g., Zenoh) may support `no_mangle = true` if they natively handle
+        services without topic-based
+
+        ``service_name`` may be a relative, private, or fully qualified service name.
+        A relative or private service will be expanded using this node's namespace and name.
+        The queried ``service_name`` is not remapped.
+
+        :param service_name: The service_name on which to find the servers.
+        :param no_mangle: If ``True``, `service_name` needs to be a valid middleware service
+            name, otherwise it should be a valid ROS service name. Defaults to ``False``.
+        :return: A list of ServiceEndpointInfo for all the servers on this service.
+        """
+        return self._get_info_by_service(
+            service_name,
+            no_mangle,
+            _rclpy.rclpy_get_servers_info_by_service)
+
+    def _get_info_by_action(
+        self,
+        action_name: str,
+        func: Callable[['_rclpy.Node', str], list['_rclpy._ActionEndpointInfoDict']]
+    ) -> List[ActionEndpointInfo]:
+        with self.handle:
+            fq_action_name = expand_topic_name(
+                action_name, self.get_name(), self.get_namespace())
+            validate_full_topic_name(fq_action_name)
+            info_dicts = func(self.handle, fq_action_name)
+            infos = [ActionEndpointInfo(**x) for x in info_dicts]
+            return infos
+
+    def get_action_clients_info_by_action(
+        self,
+        action_name: str
+    ) -> List[ActionEndpointInfo]:
+        """
+        Return a list of action clients on a given action.
+
+        The returned parameter is a list of ActionEndpointInfo objects, where each aggregates
+        the endpoint information of all the underlying entities of one action client, i.e. the
+        clients of the goal, cancel, and result services and the subscriptions on the feedback
+        and status topics.
+
+        ``action_name`` may be a relative, private, or fully qualified action name.
+        A relative or private action will be expanded using this node's namespace and name.
+        The queried ``action_name`` is not remapped.
+
+        :param action_name: The action_name on which to find the action clients.
+        :return: A list of ActionEndpointInfo for all the action clients on this action.
+        """
+        return self._get_info_by_action(
+            action_name,
+            _rclpy.rclpy_get_action_clients_info_by_action)
+
+    def get_action_servers_info_by_action(
+        self,
+        action_name: str
+    ) -> List[ActionEndpointInfo]:
+        """
+        Return a list of action servers on a given action.
+
+        The returned parameter is a list of ActionEndpointInfo objects, where each aggregates
+        the endpoint information of all the underlying entities of one action server, i.e. the
+        servers of the goal, cancel, and result services and the publishers on the feedback
+        and status topics.
+
+        ``action_name`` may be a relative, private, or fully qualified action name.
+        A relative or private action will be expanded using this node's namespace and name.
+        The queried ``action_name`` is not remapped.
+
+        :param action_name: The action_name on which to find the action servers.
+        :return: A list of ActionEndpointInfo for all the action servers on this action.
+        """
+        return self._get_info_by_action(
+            action_name,
+            _rclpy.rclpy_get_action_servers_info_by_action)
+
+    def _create_publisher_handle(
+        self,
+        msg_type: Type[MsgT],
+        topic: str,
+        qos_profile: QoSProfile,
+        *,
+        qos_overriding_options: Optional[QoSOverridingOptions] = None,
+    ) -> '_rclpy.Publisher[MsgT]':
+        try:
+            final_topic = self.resolve_topic_name(topic)
+        except RuntimeError:
+            # if it's name validation error, raise a more appropriate exception.
+            try:
+                self._validate_topic_or_service_name(topic)
+            except InvalidTopicNameException as ex:
+                raise ex from None
+            # else reraise the previous exception
+            raise
+
+        if qos_overriding_options is None:
+            qos_overriding_options = QoSOverridingOptions([])
+        _declare_qos_parameters(
+            Publisher, self, final_topic, qos_profile, qos_overriding_options)
+
+        # this line imports the typesupport for the message module if not already done
+        failed = False
+        check_is_valid_msg_type(msg_type)
+        try:
+            with self.handle:
+                publisher_object = _rclpy.Publisher(
+                    self.handle, msg_type, topic, qos_profile.get_c_qos_profile())
+        except ValueError:
+            failed = True
+        if failed:
+            self._validate_topic_or_service_name(topic)
+
+        return publisher_object
+
+    def _create_subscription_handle(
+        self,
+        msg_type: Type[MsgT],
+        topic: str,
+        qos_profile: QoSProfile,
+        *,
+        qos_overriding_options: Optional[QoSOverridingOptions] = None,
+        content_filter_options: Optional[ContentFilterOptions] = None,
+        acceptable_buffer_backends: Optional[str] = None
+    ) -> '_rclpy.Subscription[MsgT]':
+        try:
+            final_topic = self.resolve_topic_name(topic)
+        except RuntimeError:
+            # if it's name validation error, raise a more appropriate exception.
+            try:
+                self._validate_topic_or_service_name(topic)
+            except InvalidTopicNameException as ex:
+                raise ex from None
+            # else reraise the previous exception
+            raise
+
+        if qos_overriding_options is None:
+            qos_overriding_options = QoSOverridingOptions([])
+        _declare_qos_parameters(
+            Subscription, self, final_topic, qos_profile, qos_overriding_options)
+
+        # this line imports the typesupport for the message module if not already done
+        failed = False
+        check_is_valid_msg_type(msg_type)
+        try:
+            with self.handle:
+                subscription_object = _rclpy.Subscription(
+                    self.handle, msg_type, topic, qos_profile.get_c_qos_profile(),
+                    content_filter_options, acceptable_buffer_backends)
+        except ValueError:
+            failed = True
+        if failed:
+            self._validate_topic_or_service_name(topic)
+
+        return subscription_object
+
+    def _create_service_handle(
+        self,
+        srv_type: type[Srv[SrvRequestT, SrvResponseT]],
+        srv_name: str,
+        *,
+        qos_profile: QoSProfile = qos_profile_services_default,
+    ) -> '_rclpy.Service[SrvRequestT, SrvResponseT]':
+        check_is_valid_srv_type(srv_type)
+        failed = False
+        try:
+            with self.handle:
+                service_impl: '_rclpy.Service[SrvRequestT, SrvResponseT]' = _rclpy.Service(
+                    self.handle,
+                    srv_type,
+                    srv_name,
+                    qos_profile.get_c_qos_profile())
+        except ValueError:
+            failed = True
+        if failed:
+            self._validate_topic_or_service_name(srv_name, is_service=True)
+
+        return service_impl
+
+    def _create_client_handle(
+        self,
+        srv_type: type[Srv[SrvRequestT, SrvResponseT]],
+        srv_name: str,
+        *,
+        qos_profile: QoSProfile = qos_profile_services_default,
+    ) -> '_rclpy.Client[SrvRequestT, SrvResponseT]':
+        check_is_valid_srv_type(srv_type)
+        failed = False
+        try:
+            with self.handle:
+                client_impl = _rclpy.Client(
+                    self.handle,
+                    srv_type,
+                    srv_name,
+                    qos_profile.get_c_qos_profile())
+        except ValueError:
+            failed = True
+        if failed:
+            self._validate_topic_or_service_name(srv_name, is_service=True)
+
+        return client_impl
+
+    def destroy_node(self) -> None:
+        self._context.untrack_node(self)
+        self._parameter_event_publisher = None
+        self.handle.destroy_when_not_in_use()
+
+
+class Node(BaseNode):
+    """
+    A Node in the ROS graph.
+
+    A Node is the primary entrypoint in a ROS system for communication.
+    It can be used to create ROS entities such as publishers, subscribers, services, etc.
+    """
+
+    def __init__(
+        self,
+        node_name: str,
+        *,
+        context: Optional[Context] = None,
+        cli_args: Optional[List[str]] = None,
+        namespace: Optional[str] = None,
+        use_global_arguments: bool = True,
+        enable_rosout: bool = True,
+        rosout_qos_profile: Union[QoSProfile, int] = qos_profile_rosout_default,
+        start_parameter_services: bool = True,
+        parameter_overrides: Optional[List[Parameter[Any]]] = None,
+        allow_undeclared_parameters: bool = False,
+        automatically_declare_parameters_from_overrides: bool = False,
+        enable_logger_service: bool = False
+    ) -> None:
+        """
+        Create a Node.
+
+        :param node_name: A name to give to this node. Validated by :func:`validate_node_name`.
+        :param context: The context to be associated with, or ``None`` for the default global
+            context.
+        :param cli_args: A list of strings of command line args to be used only by this node.
+            These arguments are used to extract remappings used by the node and other ROS specific
+            settings, as well as user defined non-ROS arguments.
+        :param namespace: The namespace to which relative topic and service names will be prefixed.
+            Validated by :func:`validate_namespace`.
+        :param use_global_arguments: ``False`` if the node should ignore process-wide command line
+            args.
+        :param enable_rosout: ``False`` if the node should ignore rosout logging.
+        :param rosout_qos_profile: A QoSProfile or a history depth to apply to rosout publisher.
+            In the case that a history depth is provided, the QoS history is set to KEEP_LAST
+            the QoS history depth is set to the value of the parameter,
+            and all other QoS settings are set to their default value.
+        :param start_parameter_services: ``False`` if the node should not create parameter
+            services.
+        :param parameter_overrides: A list of overrides for initial values for parameters declared
+            on the node.
+        :param allow_undeclared_parameters: True if undeclared parameters are allowed.
+            This flag affects the behavior of parameter-related operations.
+        :param automatically_declare_parameters_from_overrides: If True, the "parameter overrides"
+            will be used to implicitly declare parameters on the node during creation.
+        :param enable_logger_service: ``True`` if ROS2 services are created to allow external nodes
+            to get and set logger levels of this node. Otherwise, logger levels are only managed
+            locally. That is, logger levels cannot be changed remotely.
+        """
+        self._publishers: List[Publisher[Any]] = []
+        self._subscriptions: List[Subscription[Any]] = []
+        self._clients: List[Client[Any, Any]] = []
+        self._services: List[Service[Any, Any]] = []
+        self._timers: List[Timer] = []
+        self._guards: List[GuardCondition] = []
+        self.__waitables: List[Waitable[Any]] = []
+        self._default_callback_group = MutuallyExclusiveCallbackGroup()
+        self._rate_group = ReentrantCallbackGroup()
+        self._clock = Clock(clock_type=ClockType.ROS_TIME)
+        self.__executor_weakref: Optional[weakref.ReferenceType[Executor]] = None
+
+        super().__init__(
+            node_name=node_name,
+            context=context,
+            cli_args=cli_args,
+            namespace=namespace,
+            use_global_arguments=use_global_arguments,
+            enable_rosout=enable_rosout,
+            rosout_qos_profile=rosout_qos_profile,
+            start_parameter_services=start_parameter_services,
+            parameter_overrides=parameter_overrides,
+            allow_undeclared_parameters=allow_undeclared_parameters,
+            automatically_declare_parameters_from_overrides=(
+                automatically_declare_parameters_from_overrides),
+            enable_logger_service=enable_logger_service,
+        )
+
+    @property
+    def publishers(self) -> Iterator[Publisher[Any]]:
+        """Get publishers that have been created on this node."""
+        yield from self._publishers
+
+    @property
+    def subscriptions(self) -> Iterator[Subscription[Any]]:
+        """Get subscriptions that have been created on this node."""
+        yield from self._subscriptions
+
+    @property
+    def clients(self) -> Iterator[Client[Any, Any]]:
+        """Get clients that have been created on this node."""
+        yield from self._clients
+
+    @property
+    def services(self) -> Iterator[Service[Any, Any]]:
+        """Get services that have been created on this node."""
+        yield from self._services
+
+    @property
+    def timers(self) -> Iterator[Timer]:
+        """Get timers that have been created on this node."""
+        yield from self._timers
+
+    @property
+    def guards(self) -> Iterator[GuardCondition]:
+        """Get guards that have been created on this node."""
+        yield from self._guards
+
+    @property
+    def waitables(self) -> Iterator[Waitable[Any]]:
+        """Get waitables that have been created on this node."""
+        yield from self.__waitables
+
+    @property
+    def executor(self) -> Optional[Executor]:
+        """Get the executor if the node has been added to one, else return ``None``."""
+        if self.__executor_weakref:
+            return self.__executor_weakref()
+        return None
+
+    @executor.setter
+    def executor(self, new_executor: Optional[Executor]) -> None:
+        """Set or change the executor the node belongs to."""
+        current_executor = self.executor
+        if current_executor == new_executor:
+            return
+        if current_executor is not None:
+            current_executor.remove_node(self)
+        if new_executor is None:
+            self.__executor_weakref = None
+        else:
+            new_executor.add_node(self)
+            self.__executor_weakref = weakref.ref(new_executor)
+
+    def _wake_executor(self) -> None:
+        executor = self.executor
+        if executor:
+            executor.wake()
+
+    @property
+    def default_callback_group(self) -> CallbackGroup:
+        """
+        Get the default callback group.
+
+        If no other callback group is provided when the a ROS entity is created with the node,
+        then it is added to the default callback group.
+        """
+        return self._default_callback_group
+
+    def get_clock(self) -> Clock:
+        """Get the clock used by the node."""
+        return self._clock
+
+    def add_waitable(self, waitable: Waitable[Any]) -> None:
+        """
+        Add a class that is capable of adding things to the wait set.
+
+        :param waitable: An instance of a waitable that the node will add to the waitset.
+        """
+        self.__waitables.append(waitable)
+        self._wake_executor()
+
+    def remove_waitable(self, waitable: Waitable[Any]) -> None:
+        """
+        Remove a Waitable that was previously added to the node.
+
+        :param waitable: The Waitable to remove.
+        """
+        self.__waitables.remove(waitable)
+        self._wake_executor()
+
+    def create_publisher(
+        self,
+        msg_type: Type[MsgT],
+        topic: str,
+        qos_profile: Union[QoSProfile, int],
+        *,
+        callback_group: Optional[CallbackGroup] = None,
+        event_callbacks: Optional[PublisherEventCallbacks] = None,
+        qos_overriding_options: Optional[QoSOverridingOptions] = None,
+        publisher_class: Type[Publisher[MsgT]] = Publisher,
+    ) -> Publisher[MsgT]:
+        """
+        Create a new publisher.
+
+        :param msg_type: The type of ROS messages the publisher will publish.
+        :param topic: The name of the topic the publisher will publish to.
+        :param qos_profile: A QoSProfile or a history depth to apply to the publisher.
+            In the case that a history depth is provided, the QoS history is set to
+            KEEP_LAST, the QoS history depth is set to the value
+            of the parameter, and all other QoS settings are set to their default values.
+        :param callback_group: The callback group for the publisher's event handlers.
+            If ``None``, then the default callback group for the node is used.
+        :param event_callbacks: User-defined callbacks for middleware events.
+        :return: The new publisher.
+        """
+        qos_profile_validated = self._validate_qos_or_depth_parameter(qos_profile)
+
+        callback_group = callback_group or self.default_callback_group
+
+        publisher_object = self._create_publisher_handle(
+            msg_type,
+            topic,
+            qos_profile_validated,
+            qos_overriding_options=qos_overriding_options
+        )
+
+        try:
+            publisher = publisher_class(
+                publisher_object, msg_type, topic, qos_profile_validated,
+                on_destroy=self._on_destroy_publisher,
+                event_callbacks=event_callbacks or PublisherEventCallbacks(),
+                callback_group=callback_group)
+        except Exception:
+            publisher_object.destroy_when_not_in_use()
+            raise
+        self._publishers.append(publisher)
+        self._wake_executor()
+
+        for event_callback in publisher.event_handlers:
+            self.add_waitable(event_callback)
+
+        return publisher
+
+    @overload
+    def create_subscription(
+        self,
+        msg_type: Type[MsgT],
+        topic: str,
+        callback: GenericSubscriptionCallbackUnion[bytes],
+        qos_profile: Union[QoSProfile, int],
+        *,
+        callback_group: Optional[CallbackGroup] = None,
+        event_callbacks: Optional[SubscriptionEventCallbacks] = None,
+        qos_overriding_options: Optional[QoSOverridingOptions] = None,
+        raw: Literal[True],
+        content_filter_options: Optional[ContentFilterOptions] = None,
+        acceptable_buffer_backends: Optional[str] = None
+    ) -> Subscription[MsgT]: ...
+
+    @overload
+    def create_subscription(
+        self,
+        msg_type: Type[MsgT],
+        topic: str,
+        callback: GenericSubscriptionCallbackUnion[MsgT],
+        qos_profile: Union[QoSProfile, int],
+        *,
+        callback_group: Optional[CallbackGroup] = None,
+        event_callbacks: Optional[SubscriptionEventCallbacks] = None,
+        qos_overriding_options: Optional[QoSOverridingOptions] = None,
+        raw: Literal[False],
+        content_filter_options: Optional[ContentFilterOptions] = None
+    ) -> Subscription[MsgT]: ...
+
+    @overload
+    def create_subscription(
+        self,
+        msg_type: Type[MsgT],
+        topic: str,
+        callback: SubscriptionCallbackUnion[MsgT],
+        qos_profile: Union[QoSProfile, int],
+        *,
+        callback_group: Optional[CallbackGroup] = None,
+        event_callbacks: Optional[SubscriptionEventCallbacks] = None,
+        qos_overriding_options: Optional[QoSOverridingOptions] = None,
+        raw: bool = False,
+        content_filter_options: Optional[ContentFilterOptions] = None,
+        acceptable_buffer_backends: Optional[str] = None
+    ) -> Subscription[MsgT]: ...
+
+    def create_subscription(
+        self,
+        msg_type: Type[MsgT],
+        topic: str,
+        callback: SubscriptionCallbackUnion[MsgT],
+        qos_profile: Union[QoSProfile, int],
+        *,
+        callback_group: Optional[CallbackGroup] = None,
+        event_callbacks: Optional[SubscriptionEventCallbacks] = None,
+        qos_overriding_options: Optional[QoSOverridingOptions] = None,
+        raw: bool = False,
+        content_filter_options: Optional[ContentFilterOptions] = None,
+        acceptable_buffer_backends: Optional[str] = None
+    ) -> Subscription[MsgT]:
+        """
+        Create a new subscription.
+
+        :param msg_type: The type of ROS messages the subscription will subscribe to.
+        :param topic: The name of the topic the subscription will subscribe to.
+        :param callback: A user-defined callback function that is called when a message is
+            received by the subscription.
+        :param qos_profile: A QoSProfile or a history depth to apply to the subscription.
+            In the case that a history depth is provided, the QoS history is set to
+            KEEP_LAST, the QoS history depth is set to the value
+            of the parameter, and all other QoS settings are set to their default values.
+        :param callback_group: The callback group for the subscription. If ``None``, then the
+            default callback group for the node is used.
+        :param event_callbacks: User-defined callbacks for middleware events.
+        :param raw: If ``True``, then received messages will be stored in raw binary
+            representation.
+        :param content_filter_options: The filter expression and parameters for content filtering.
+        :param acceptable_buffer_backends: Comma-separated list of acceptable buffer backend
+            names. ``None``, empty, or ``"cpu"`` all mean CPU-only (default for backward
+            compatibility). ``"any"`` means all installed backends are acceptable.
+            CPU is always implicitly acceptable.
+        """
+        qos_profile = self._validate_qos_or_depth_parameter(qos_profile)
+
+        callback_group = callback_group or self.default_callback_group
+
+        subscription_object = self._create_subscription_handle(
+            msg_type,
+            topic,
+            qos_profile,
+            qos_overriding_options=qos_overriding_options,
+            content_filter_options=content_filter_options,
+            acceptable_buffer_backends=acceptable_buffer_backends
+        )
+
+        try:
+            subscription = Subscription(
+                subscription_object, msg_type,
+                topic, callback, qos_profile, raw,
+                on_destroy=self._on_destroy_subscription,
+                callback_group=callback_group,
+                event_callbacks=event_callbacks or SubscriptionEventCallbacks())
+        except Exception:
+            subscription_object.destroy_when_not_in_use()
+            raise
+        callback_group.add_entity(subscription)
+        self._subscriptions.append(subscription)
+        self._wake_executor()
+
+        for event_handler in subscription.event_handlers:
+            self.add_waitable(event_handler)
+
+        return subscription
+
+    def create_client(
+        self,
+        srv_type: type[Srv[SrvRequestT, SrvResponseT]],
+        srv_name: str,
+        *,
+        qos_profile: QoSProfile = qos_profile_services_default,
+        callback_group: Optional[CallbackGroup] = None
+    ) -> Client[SrvRequestT, SrvResponseT]:
+        """
+        Create a new service client.
+
+        :param srv_type: The service type.
+        :param srv_name: The name of the service.
+        :param qos_profile: The quality of service profile to apply the service client.
+        :param callback_group: The callback group for the service client. If ``None``, then the
+            default callback group for the node is used.
+        """
+        if callback_group is None:
+            callback_group = self.default_callback_group
+
+        client_impl = self._create_client_handle(
+            srv_type,
+            srv_name,
+            qos_profile=qos_profile
+        )
+
+        client = Client(
+            self.context,
+            client_impl, srv_type, srv_name, qos_profile,
+            on_destroy=self._on_destroy_client,
+            callback_group=callback_group)
+        callback_group.add_entity(client)
+        self._clients.append(client)
+        self._wake_executor()
+        return client
+
+    def create_service(
+        self,
+        srv_type: type[Srv[SrvRequestT, SrvResponseT]],
+        srv_name: str,
+        callback: ServiceCallbackUnion[SrvRequestT, SrvResponseT],
+        *,
+        qos_profile: QoSProfile = qos_profile_services_default,
+        callback_group: Optional[CallbackGroup] = None
+    ) -> Service[SrvRequestT, SrvResponseT]:
+        """
+        Create a new service server.
+
+        :param srv_type: The service type.
+        :param srv_name: The name of the service.
+        :param callback: A user-defined callback function that is called when a service request
+            received by the server.
+        :param qos_profile: The quality of service profile to apply the service server.
+        :param callback_group: The callback group for the service server. If ``None``, then the
+            default callback group for the node is used.
+        """
+        service_impl = self._create_service_handle(
+            srv_type,
+            srv_name,
+            qos_profile=qos_profile
+        )
+
+        return self._create_service(
+            service_impl,
+            srv_type,
+            srv_name,
+            callback,
+            qos_profile,
+            callback_group
+            )
+
+    def _create_service(
+        self,
+        service_impl: '_rclpy.Service[SrvRequestT, SrvResponseT]',
+        srv_type: type[Srv[SrvRequestT, SrvResponseT]],
+        srv_name: str,
+        callback: ServiceCallbackUnion[SrvRequestT, SrvResponseT],
+        qos_profile: QoSProfile,
+        callback_group: Optional[CallbackGroup] = None,
+    ) -> Service[SrvRequestT, SrvResponseT]:
+        if callback_group is None:
+            callback_group = self.default_callback_group
+        service = Service(
+            service_impl,
+            srv_type, srv_name, callback, qos_profile,
+            on_destroy=self._on_destroy_service,
+            callback_group=callback_group)
+        callback_group.add_entity(service)
+        self._services.append(service)
+        self._wake_executor()
+        return service
+
+    def create_timer(
+        self,
+        timer_period_sec: float,
+        callback: TimerCallbackUnion | None,
+        callback_group: Optional[CallbackGroup] = None,
+        clock: Optional[Clock] = None,
+        autostart: bool = True,
+    ) -> Timer:
+        """
+        Create a new timer.
+
+        If autostart is ``True`` (the default), the timer will be started and every
+        ``timer_period_sec`` number of seconds the provided callback function will be called.
+        If autostart is ``False``, the timer will be created but not started; it can then be
+        started by calling ``reset()`` on the timer object.
+
+        :param timer_period_sec: The period (in seconds) of the timer.
+        :param callback: A user-defined callback function that is called when the timer expires.
+        :param callback_group: The callback group for the timer. If ``None``, then the
+            default callback group for the node is used.
+        :param clock: The clock which the timer gets time from.
+        :param autostart: Whether to automatically start the timer after creation; defaults to
+            ``True``.
+        """
+        timer_period_nsec = int(float(timer_period_sec) * S_TO_NS)
+        if callback_group is None:
+            callback_group = self.default_callback_group
+        if clock is None:
+            clock = self._clock
+        timer = Timer(
+            callback, timer_period_nsec, clock,
+            callback_group=callback_group,
+            on_destroy=self._on_destroy_timer,
+            context=self.context,
+            autostart=autostart
+        )
+
+        callback_group.add_entity(timer)
+        self._timers.append(timer)
+        self._wake_executor()
+        return timer
+
+    def create_guard_condition(
+        self,
+        callback: GuardConditionCallbackType,
+        callback_group: Optional[CallbackGroup] = None
+    ) -> GuardCondition:
+        """
+        Create a new guard condition.
+
+        .. warning:: Users should call :meth:`.Node.destroy_guard_condition` to destroy
+           the GuardCondition object.
+        """
+        if callback_group is None:
+            callback_group = self.default_callback_group
+        guard = GuardCondition(callback, callback_group, context=self.context)
+
+        callback_group.add_entity(guard)
+        self._guards.append(guard)
+        self._wake_executor()
+        return guard
+
+    def create_rate(
+        self,
+        frequency: float,
+        clock: Optional[Clock] = None,
+    ) -> Rate:
+        """
+        Create a Rate object.
+
+        .. warning:: Users should call :meth:`.Node.destroy_rate` to destroy the Rate object.
+
+        :param frequency: The frequency the Rate runs at (Hz).
+        :param clock: The clock the Rate gets time from.
+        """
+        if frequency <= 0:
+            raise ValueError('frequency must be > 0')
+        # Create a timer and give it to the rate object
+        period = 1.0 / frequency
+        # Rate will set its own callback
+        callback = None
+        # Rates get their own group so timing is not messed up by other callbacks
+        group = self._rate_group
+        timer = self.create_timer(period, callback, group, clock)
+        return Rate(timer, context=self.context)
+
+    def _on_destroy_publisher(self, publisher: Publisher[Any]) -> None:
+        self._publishers.remove(publisher)
+        for event_handler in publisher.event_handlers:
+            self.__waitables.remove(event_handler)
+        self._wake_executor()
+
+    def _on_destroy_subscription(self, subscription: Subscription[Any]) -> None:
+        self._subscriptions.remove(subscription)
+        for event_handler in subscription.event_handlers:
+            self.__waitables.remove(event_handler)
+        self._wake_executor()
+
+    def _on_destroy_client(self, client: Client[Any, Any]) -> None:
+        self._clients.remove(client)
+        self._wake_executor()
+
+    def _on_destroy_service(self, service: Service[Any, Any]) -> None:
+        self._services.remove(service)
+        self._wake_executor()
+
+    def _on_destroy_timer(self, timer: Timer) -> None:
+        self._timers.remove(timer)
+        self._wake_executor()
+
+    def destroy_publisher(self, publisher: Publisher[Any]) -> bool:
+        """
+        Destroy a publisher created by the node.
+
+        :return: ``True`` if successful, ``False`` otherwise.
+        """
+        if publisher in self._publishers:
+            publisher.destroy()
+            return True
+        return False
+
+    def destroy_subscription(self, subscription: Subscription[Any]) -> bool:
+        """
+        Destroy a subscription created by the node.
+
+        :return: ``True`` if successful, ``False`` otherwise.
+        """
+        if subscription in self._subscriptions:
+            subscription.destroy()
+            return True
+        return False
+
+    def destroy_client(self, client: Client[Any, Any]) -> bool:
+        """
+        Destroy a service client created by the node.
+
+        :return: ``True`` if successful, ``False`` otherwise.
+        """
+        if client in self._clients:
+            client.destroy()
+            return True
+        return False
+
+    def destroy_service(self, service: Service[Any, Any]) -> bool:
+        """
+        Destroy a service server created by the node.
+
+        :return: ``True`` if successful, ``False`` otherwise.
+        """
+        if service in self._services:
+            service.destroy()
+            return True
+        return False
+
+    def destroy_timer(self, timer: Timer) -> bool:
+        """
+        Destroy a timer created by the node.
+
+        :return: ``True`` if successful, ``False`` otherwise.
+        """
+        if timer in self._timers:
+            timer.destroy()
+            return True
+        return False
+
+    def destroy_guard_condition(self, guard: GuardCondition) -> bool:
+        """
+        Destroy a guard condition created by the node.
+
+        :return: ``True`` if successful, ``False`` otherwise.
+        """
+        if guard in self._guards:
+            self._guards.remove(guard)
+            try:
+                guard.destroy()
+            except InvalidHandle:
+                return False
+            self._wake_executor()
+            return True
+        return False
+
+    def destroy_rate(self, rate: Rate) -> bool:
+        """
+        Destroy a Rate object created by the node.
+
+        :return: ``True`` if successful, ``False`` otherwise.
+        """
+        success = self.destroy_timer(rate._timer)
+        rate.destroy()
+        return success
+
+    def destroy_node(self) -> None:
+        """
+        Destroy the node.
+
+        Frees resources used by the node, including any entities created by the following methods:
+
+        * :func:`create_publisher`
+        * :func:`create_subscription`
+        * :func:`create_client`
+        * :func:`create_service`
+        * :func:`create_timer`
+        * :func:`create_guard_condition`
+
+        """
+        self._context.untrack_node(self)
+
+        # Destroy dependent items eagerly to work around a possible hang
+        # https://github.com/ros2/build_cop/issues/248
+        while self._publishers:
+            self.destroy_publisher(self._publishers[0])
+        while self._subscriptions:
+            self.destroy_subscription(self._subscriptions[0])
+        while self._clients:
+            self.destroy_client(self._clients[0])
+        while self._services:
+            self.destroy_service(self._services[0])
+        while self._timers:
+            self.destroy_timer(self._timers[0])
+        while self._guards:
+            self.destroy_guard_condition(self._guards[0])
+        super().destroy_node()
+        self._wake_executor()
+
+    def wait_for_node(
+        self,
+        fully_qualified_node_name: str,
+        timeout: float
+    ) -> bool:
+        """
+        Wait until node name is present in the system or timeout.
+
+        The node name should be the full name with namespace.
+
+        :param fully_qualified_node_name: Fully qualified name of the node to wait for.
+        :param timeout: Seconds to wait for the node to be present. If negative, the function
+                         won't timeout.
+        :return: ``True`` if the node was found, ``False`` if timeout.
+        """
+        if not fully_qualified_node_name.startswith('/'):
+            fully_qualified_node_name = f'/{fully_qualified_node_name}'
+
+        start = time.time()
+        flag = False
+        # TODO refactor this implementation when we can react to guard condition events, or replace
+        # it entirely with an implementation in rcl. see https://github.com/ros2/rclpy/issues/929
+        while time.time() - start < timeout and not flag:
+            fully_qualified_node_names = self.get_fully_qualified_node_names()
+            flag = fully_qualified_node_name in fully_qualified_node_names
+            time.sleep(0.1)
+        return flag
+
+    def __enter__(self) -> 'Node':
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> None:
+        self.destroy_node()
